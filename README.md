@@ -3,9 +3,10 @@
 A conversational agent that answers questions about a fictional clinic and books
 appointments over Telegram, backed by Google Calendar with an email confirmation.
 
-**Phases 1–2 of 5 complete.** Intent classification, datetime resolution,
-business-hours validation, conversation state, and both Telegram transports are done.
-Calendar and email are typed interfaces awaiting Phases 3 and 4.
+**Phases 1–3 of 5 complete.** The bot books real appointments on a real Google
+Calendar. Intent classification, datetime resolution, business-hours validation,
+availability search, event creation, conversation state and both Telegram transports
+are done. Email confirmation is a typed interface awaiting Phase 4.
 
 ## Quick start
 
@@ -67,8 +68,31 @@ Step 3  dispatch           greeting | faq | booking | out_of_scope
           └─ booking only: Layer 2 resolves the time phrase     second Groq call
 ```
 
-Greetings, FAQs and refusals cost exactly one call. Booking costs two. A message that
-never reaches Step 2 costs none.
+Greetings, FAQs and refusals cost exactly one call. Booking costs two, both on the
+first turn. A message that never reaches Step 2 costs none — and neither does any turn
+of the confirmation flow below.
+
+### The booking conversation
+
+```
+idle
+  -> propose a genuinely free slot      awaiting_slot_confirmation
+  -> collect the patient's address      awaiting_email
+  -> read the whole thing back          awaiting_final_confirmation
+  -> create the event, return to        idle
+```
+
+Every transition is deterministic — classifying "yes" would double the cost of a booking
+and add a failure mode to the least ambiguous message in the conversation. Yes/no
+parsing requires *every* word to be recognised, so "yeah go ahead" confirms but
+"ok Tuesday" does not: it names a day the bot never proposed, and confirming the old
+slot on it would book the wrong appointment. Anything unrecognised goes back to the
+classifier, so "actually can we do 4pm?" re-proposes instead of being told to say yes
+or no.
+
+**Availability is re-checked immediately before the event is created.** A slot that was
+free when proposed can be taken while the user types their email, and booking on the
+earlier answer is how two patients end up in one slot.
 
 **Step 1 before Step 2 is the load-bearing decision.** If the bot has asked "is 2pm
 alright?" and the user replies "yes", classifying that message in isolation returns
@@ -131,8 +155,24 @@ catch it, since every test fakes the model; `tests/test_llm.py` asserts the floo
 records why.
 
 **Naive datetimes raise at construction** rather than being caught by convention. A
-naive value that reaches Phase 3's slot search either raises deep in the call stack or,
-worse, silently represents the wrong wall clock.
+naive value reaching the slot search either raises deep in the call stack or, worse,
+silently represents the wrong wall clock.
+
+**Calendar events never carry attendees.** A service account without Domain-Wide
+Delegation gets `HTTP 403 forbiddenForServiceAccounts`, and that fails the *entire*
+event creation rather than degrading — one attendee field would break every booking.
+Delegation needs a Workspace domain a personal calendar cannot grant, so the patient's
+address goes in the event description and their confirmation is Phase 4's SMTP mail.
+The event is the clinic's record; the email is the patient's.
+
+**Slot overlap is half-open at both ends**, so back-to-back appointments are not
+clashes. Treating a shared boundary as a collision would lose the slot either side of
+every existing event — about a third of a working day, for nothing.
+
+**No `google-api-python-client`.** It is synchronous and builds its own HTTP stack;
+only four endpoints are needed, so they are called over httpx directly. `google-auth`
+is installed without its `[requests]` extra for the same reason, with an httpx
+transport supplied in `calendar_service.py`.
 
 **Deduplication is bounded** — a deque plus a set, capped. Telegram redelivers until
 acknowledged, and an unbounded set grows for the life of the process.
@@ -152,14 +192,20 @@ is held at WARNING because its INFO request line contains the bot token.
 venv/Scripts/python -m pytest
 ```
 
-194 tests, Groq faked at the `complete_json` seam — the narrowest point that still
+300 tests, Groq faked at the `complete_json` seam — the narrowest point that still
 exercises parsing, validation and error handling. Several assert work *not* done: a
 sticker costs zero model calls, a mid-flow reply skips the classifier entirely, and a
 booking with no time phrase never reaches Layer 2.
 
+Google is faked at the HTTP layer with respx, so request bodies are asserted rather
+than assumed — that attendees are never sent, that the slot end comes from the domain's
+slot length, and that a per-calendar `freeBusy` error is not mistaken for a free day.
+
 Verified by mutation, not just by passing: rounding slots down, dropping the weekend
 check, rolling a late request to the next day, acting on a low-confidence resolution,
-or leaving a placeholder unsubstituted in a prompt each turns the suite red.
+leaving a placeholder unsubstituted in a prompt, skipping the pre-booking re-check,
+closing the overlap boundaries, or accepting "ok Tuesday" as a yes each turns the
+suite red.
 
 ## Layout
 
@@ -174,7 +220,7 @@ app/
   state/               ConversationState, StateStore + InMemoryStateStore
   domain/business.py   clinic facts, hours, slot grid, booking rule
   domain/scheduling.py business-hours validation, slot alignment
-  services/            calendar + email interfaces (Phases 3-4)
+  services/            calendar (live) + email interface (Phase 4)
 prompts/               the prompt driving each phase
 tests/
 ```
@@ -185,6 +231,6 @@ tests/
 |---|---|---|
 | 1 | Scaffold, transports, routing layer | complete |
 | 2 | Datetime resolution, business-hours validation | complete |
-| 3 | Calendar availability, slot search, event creation | interface only |
+| 3 | Calendar availability, slot search, event creation | complete |
 | 4 | Email confirmation | interface only |
 | 5 | Deployment | not started |

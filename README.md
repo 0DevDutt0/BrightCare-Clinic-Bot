@@ -3,10 +3,11 @@
 A conversational agent that answers questions about a fictional clinic and books
 appointments over Telegram, backed by Google Calendar with an email confirmation.
 
-**Phases 1–3 of 5 complete.** The bot books real appointments on a real Google
-Calendar. Intent classification, datetime resolution, business-hours validation,
-availability search, event creation, conversation state and both Telegram transports
-are done. Email confirmation is a typed interface awaiting Phase 4.
+**Phases 1–4 of 5 complete.** The bot books real appointments on a real Google
+Calendar and emails the patient a confirmation with a calendar attachment. Intent
+classification, datetime resolution, business-hours validation, availability search,
+event creation, SMTP confirmation, conversation state and both Telegram transports are
+done. Only deployment (Phase 5) remains.
 
 ## Quick start
 
@@ -40,8 +41,18 @@ In a `.env` file the inline JSON **must be wrapped in single quotes**. Double qu
 make dotenv expand the `\n` escapes inside `private_key` into real newlines, and a raw
 newline inside a JSON string is invalid JSON.
 
-SMTP is optional until Phase 4; `settings.email_configured` reports whether it is
-complete, so Phase 4 needs no configuration change.
+`settings.email_configured` picks between the real SMTP service and a disabled one at
+startup, so the app runs and books appointments without SMTP credentials — only the
+confirmation is lost, and the reply says so rather than promising one.
+
+**Environment variables outrank `.env`.** That is deliberate — it is how a host injects
+configuration in production — but it means a stray `TELEGRAM_BOT_TOKEN` or
+`GROQ_API_KEY` in your shell silently wins over the file. If the bot seems to ignore an
+edit, check `os.environ` first, or run with them cleared:
+
+```bash
+env -u TELEGRAM_BOT_TOKEN -u GROQ_API_KEY ./venv/Scripts/python -m uvicorn app.main:app --port 8000
+```
 
 ## Transports
 
@@ -177,6 +188,14 @@ transport supplied in `calendar_service.py`.
 **Deduplication is bounded** — a deque plus a set, capped. Telegram redelivers until
 acknowledged, and an unbounded set grows for the life of the process.
 
+**A failed email never rolls back a booked appointment.** The calendar event is the
+clinic's record and the email is the patient's; they fail independently, and the reply
+states which of the two happened rather than promising a confirmation that never left.
+
+**The confirmation carries an `.ics` attachment.** Not decoration: since attendees are
+impossible, that file is the only route the appointment has into the patient's own
+calendar.
+
 ## Secrets
 
 `.env` and `credentials/` are gitignored. Secrets are `SecretStr` and the service
@@ -192,7 +211,7 @@ is held at WARNING because its INFO request line contains the bot token.
 venv/Scripts/python -m pytest
 ```
 
-300 tests, Groq faked at the `complete_json` seam — the narrowest point that still
+327 tests, Groq faked at the `complete_json` seam — the narrowest point that still
 exercises parsing, validation and error handling. Several assert work *not* done: a
 sticker costs zero model calls, a mid-flow reply skips the classifier entirely, and a
 booking with no time phrase never reaches Layer 2.
@@ -220,7 +239,7 @@ app/
   state/               ConversationState, StateStore + InMemoryStateStore
   domain/business.py   clinic facts, hours, slot grid, booking rule
   domain/scheduling.py business-hours validation, slot alignment
-  services/            calendar (live) + email interface (Phase 4)
+  services/            calendar + email, both live
 prompts/               the prompt driving each phase
 tests/
 ```
@@ -232,5 +251,5 @@ tests/
 | 1 | Scaffold, transports, routing layer | complete |
 | 2 | Datetime resolution, business-hours validation | complete |
 | 3 | Calendar availability, slot search, event creation | complete |
-| 4 | Email confirmation | interface only |
+| 4 | Email confirmation | complete |
 | 5 | Deployment | not started |

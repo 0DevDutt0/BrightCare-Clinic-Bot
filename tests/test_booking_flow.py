@@ -23,7 +23,14 @@ from app.agent.orchestrator import Orchestrator
 from app.domain.business import CLINIC_ADDRESS
 from app.services.calendar_service import CalendarError
 
-from tests.conftest import TZ, FakeCalendarService, FakeGroqClient, classification, resolution
+from tests.conftest import (
+    TZ,
+    FakeCalendarService,
+    FakeEmailService,
+    FakeGroqClient,
+    classification,
+    resolution,
+)
 
 CHAT_ID = 555
 MON_2PM = datetime(2026, 9, 7, 14, 0, tzinfo=TZ)
@@ -277,6 +284,7 @@ async def test_an_unreachable_calendar_degrades_gracefully_when_proposing(
         store=store,
         resolver=DatetimeResolver(fake_llm),
         calendar=broken,
+        email=FakeEmailService(),
         tz=TZ,
         now=lambda: FIXED_NOW,
     )
@@ -303,3 +311,94 @@ async def test_a_create_failure_keeps_the_user_in_the_flow(
 
     assert reply.text == CALENDAR_TROUBLE
     assert (await store.get(CHAT_ID)).stage == "awaiting_final_confirmation"
+
+
+# ------------------------------------------------------------ confirmation email
+
+async def test_a_confirmation_email_is_sent_after_the_event_is_created(
+    orchestrator: Orchestrator,
+    fake_llm: FakeGroqClient,
+    calendar: FakeCalendarService,
+    email: FakeEmailService,
+) -> None:
+    await request_monday_2pm(orchestrator, fake_llm)
+    await orchestrator.handle(CHAT_ID, {"text": "yes"})
+    await orchestrator.handle(CHAT_ID, {"text": "dev@example.com"})
+
+    reply = await orchestrator.handle(CHAT_ID, {"text": "yes"})
+
+    assert len(email.sent) == 1
+    assert email.sent[0]["to_email"] == "dev@example.com"
+    assert email.sent[0]["appointment_start"] == MON_2PM
+    assert email.sent[0]["patient_name"] == "Dev"
+    assert "sent a confirmation" in reply.text
+
+
+async def test_a_failed_email_does_not_undo_a_real_appointment(
+    orchestrator: Orchestrator,
+    fake_llm: FakeGroqClient,
+    calendar: FakeCalendarService,
+    email: FakeEmailService,
+    store,
+) -> None:
+    """The event exists. Rolling it back over a mail server would lose a real booking."""
+    from app.services.email_service import EmailError
+
+    await request_monday_2pm(orchestrator, fake_llm)
+    await orchestrator.handle(CHAT_ID, {"text": "yes"})
+    await orchestrator.handle(CHAT_ID, {"text": "dev@example.com"})
+
+    email.error = EmailError("smtp down")
+    reply = await orchestrator.handle(CHAT_ID, {"text": "yes"})
+
+    assert len(calendar.created) == 1              # the appointment stands
+    assert "Booked." in reply.text
+    assert "couldn't send the confirmation email" in reply.text
+    assert (await store.get(CHAT_ID)).stage == "idle"
+
+
+async def test_the_email_is_sent_only_after_the_event_exists(
+    orchestrator: Orchestrator,
+    fake_llm: FakeGroqClient,
+    calendar: FakeCalendarService,
+    email: FakeEmailService,
+) -> None:
+    """Confirming an appointment that then fails to save is worse than no email."""
+    from app.services.calendar_service import CalendarError
+
+    await request_monday_2pm(orchestrator, fake_llm)
+    await orchestrator.handle(CHAT_ID, {"text": "yes"})
+    await orchestrator.handle(CHAT_ID, {"text": "dev@example.com"})
+
+    calendar.error = CalendarError("500 from Google")
+    await orchestrator.handle(CHAT_ID, {"text": "yes"})
+
+    assert email.sent == []
+
+
+async def test_a_cancelled_booking_sends_no_email(
+    orchestrator: Orchestrator, fake_llm: FakeGroqClient, email: FakeEmailService
+) -> None:
+    await request_monday_2pm(orchestrator, fake_llm)
+    await orchestrator.handle(CHAT_ID, {"text": "yes"})
+    await orchestrator.handle(CHAT_ID, {"text": "dev@example.com"})
+
+    await orchestrator.handle(CHAT_ID, {"text": "no"})
+
+    assert email.sent == []
+
+
+async def test_a_slot_lost_to_a_race_sends_no_email(
+    orchestrator: Orchestrator,
+    fake_llm: FakeGroqClient,
+    calendar: FakeCalendarService,
+    email: FakeEmailService,
+) -> None:
+    await request_monday_2pm(orchestrator, fake_llm)
+    await orchestrator.handle(CHAT_ID, {"text": "yes"})
+    await orchestrator.handle(CHAT_ID, {"text": "dev@example.com"})
+
+    calendar.taken_on_next_check = {MON_2PM}
+    await orchestrator.handle(CHAT_ID, {"text": "yes"})
+
+    assert email.sent == []

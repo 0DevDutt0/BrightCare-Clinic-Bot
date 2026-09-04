@@ -24,6 +24,7 @@ from tests.conftest import (
     FIXED_NOW,
     TZ,
     FakeCalendarService,
+    FakeEmailService,
     FakeGroqClient,
     classification,
     resolution,
@@ -276,6 +277,7 @@ async def test_llm_transport_failure_falls_back_without_raising(
         store=store,
         resolver=DatetimeResolver(failing),
         calendar=FakeCalendarService(),
+        email=FakeEmailService(),
         tz=TZ,
         now=lambda: FIXED_NOW,
     )

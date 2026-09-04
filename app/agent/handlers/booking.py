@@ -41,6 +41,7 @@ from app.domain.scheduling import (
     opening_hours_sentence,
 )
 from app.services.calendar_service import CalendarError, CalendarService
+from app.services.email_service import EmailError, EmailService
 from app.state.models import ConversationState
 
 logger = logging.getLogger(__name__)
@@ -234,6 +235,7 @@ async def continue_booking(
     state: ConversationState,
     text: str,
     calendar: CalendarService,
+    email: EmailService,
     now: datetime,
     tz: ZoneInfo,
 ) -> str | None:
@@ -247,7 +249,7 @@ async def continue_booking(
     if state.stage == "awaiting_email":
         return _handle_email(state, text)
     if state.stage == "awaiting_final_confirmation":
-        return await _handle_final_confirmation(state, text, calendar)
+        return await _handle_final_confirmation(state, text, calendar, email)
 
     logger.warning("booking.unknown_stage", extra={"stage": state.stage})
     state.reset_flow()
@@ -288,7 +290,10 @@ def _handle_email(state: ConversationState, text: str) -> str | None:
 
 
 async def _handle_final_confirmation(
-    state: ConversationState, text: str, calendar: CalendarService
+    state: ConversationState,
+    text: str,
+    calendar: CalendarService,
+    email: EmailService,
 ) -> str | None:
     answer = _sentiment(text)
     if answer is None:
@@ -323,12 +328,34 @@ async def _handle_final_confirmation(
         logger.exception("booking.create_failed")
         return CALENDAR_TROUBLE
 
-    logger.info("booking.confirmed", extra={"event_id": event_id})
+    # The appointment exists now. The email is a separate promise, and a broken SMTP
+    # server must not undo a real booking -- so this is reported, never rolled back.
+    email_sent = False
+    if state.patient_email:
+        try:
+            await email.send_confirmation(
+                to_email=state.patient_email,
+                appointment_start=slot,
+                patient_name=state.patient_name,
+            )
+            email_sent = True
+        except EmailError:
+            logger.exception("booking.email_failed", extra={"event_id": event_id})
+
+    logger.info(
+        "booking.confirmed", extra={"event_id": event_id, "email_sent": email_sent}
+    )
     state.reset_flow()
     state.touch()
+
+    booked = f"Booked. Your appointment is {format_slot(slot)} at {CLINIC_ADDRESS}."
+    if email_sent:
+        return f"{booked} I've sent a confirmation to your email."
+    # Say what actually happened: the appointment is real either way, and a patient
+    # who is told to expect an email that never arrives will assume it failed.
     return (
-        f"Booked. Your appointment is {format_slot(slot)} at {CLINIC_ADDRESS}. "
-        "A confirmation email will follow shortly."
+        f"{booked} I couldn't send the confirmation email just now, but your "
+        "appointment is booked and we'll see you then."
     )
 
 

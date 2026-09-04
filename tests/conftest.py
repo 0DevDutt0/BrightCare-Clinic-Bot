@@ -23,6 +23,7 @@ from app.agent.resolver import DatetimeResolver
 from app.agent.router import IntentRouter
 from app.domain.business import SLOT_DURATION, slot_starts
 from app.services.calendar_service import CalendarService
+from app.services.email_service import EmailService
 from app.state.store import InMemoryStateStore
 from app.telegram.handler import UpdateHandler
 
@@ -138,6 +139,30 @@ class FakeCalendarService(CalendarService):
         return f"evt-{len(self.created)}"
 
 
+class FakeEmailService(EmailService):
+    """Records confirmations instead of sending them."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.sent: list[dict[str, Any]] = []
+
+    async def send_confirmation(
+        self,
+        to_email: str,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+    ) -> None:
+        if self.error is not None:
+            raise self.error
+        self.sent.append(
+            {
+                "to_email": to_email,
+                "appointment_start": appointment_start,
+                "patient_name": patient_name,
+            }
+        )
+
+
 class FakeTelegramClient:
     """Captures outbound messages instead of sending them."""
 
@@ -235,10 +260,16 @@ def calendar() -> FakeCalendarService:
 
 
 @pytest.fixture
+def email() -> FakeEmailService:
+    return FakeEmailService()
+
+
+@pytest.fixture
 def orchestrator(
     fake_llm: FakeGroqClient,
     store: InMemoryStateStore,
     calendar: FakeCalendarService,
+    email: FakeEmailService,
 ) -> Orchestrator:
     """Both layers share one fake client, so queued responses are consumed in order:
     the classification first, then the resolution if the booking path reaches it."""
@@ -247,6 +278,7 @@ def orchestrator(
         store=store,
         resolver=DatetimeResolver(fake_llm),
         calendar=calendar,
+        email=email,
         tz=TZ,
         now=lambda: FIXED_NOW,
     )

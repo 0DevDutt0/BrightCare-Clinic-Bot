@@ -34,6 +34,7 @@ from app.agent.resolver import DatetimeResolver
 from app.agent.router import IntentRouter, RoutingError
 from app.domain.business import CAPABILITIES, WELCOME
 from app.services.calendar_service import CalendarService
+from app.services.email_service import EmailService
 from app.state.store import StateStore
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ class Orchestrator:
         store: StateStore,
         resolver: DatetimeResolver,
         calendar: CalendarService,
+        email: EmailService,
         tz: ZoneInfo,
         now: Callable[[], datetime] | None = None,
     ) -> None:
@@ -92,6 +94,7 @@ class Orchestrator:
         self._store = store
         self._resolver = resolver
         self._calendar = calendar
+        self._email = email
         self._tz = tz
         # Injectable so "tomorrow at 3pm" can be tested against a fixed reference
         # instead of whatever day the suite happens to run on.
@@ -147,7 +150,7 @@ class Orchestrator:
                 return await self._finish(state, Reply(FLOW_CLEARED, "flow_cleared"))
 
             flow_reply = await continue_booking(
-                state, stripped, self._calendar, self._now(), self._tz
+                state, stripped, self._calendar, self._email, self._now(), self._tz
             )
             if flow_reply is not None:
                 logger.info(

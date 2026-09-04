@@ -22,6 +22,11 @@ from app.agent.router import IntentRouter
 from app.config import Settings, get_settings
 from app.logging_config import configure_logging
 from app.services.calendar_service import GoogleCalendarService
+from app.services.email_service import (
+    DisabledEmailService,
+    EmailService,
+    SmtpEmailService,
+)
 from app.state.store import InMemoryStateStore
 from app.telegram.client import TelegramClient, TelegramError
 from app.telegram.handler import UpdateHandler
@@ -48,12 +53,28 @@ def build_components(settings: Settings) -> dict[str, Any]:
         calendar_id=settings.google_calendar_id,
         tz=settings.tz,
     )
+    # Without SMTP the app still books appointments; only the confirmation is lost,
+    # and DisabledEmailService raises so the reply says so rather than promising one.
+    email: EmailService
+    if settings.email_configured:
+        email = SmtpEmailService(
+            host=settings.smtp_host,
+            port=settings.smtp_port,
+            username=settings.smtp_username,
+            password=settings.smtp_password.get_secret_value(),
+            from_email=settings.from_email,
+            from_name=settings.from_name,
+        )
+    else:
+        email = DisabledEmailService()
+
     # Both layers share one client: same model, same retry policy, one connection pool.
     orchestrator = Orchestrator(
         router=IntentRouter(llm),
         store=store,
         resolver=DatetimeResolver(llm),
         calendar=calendar,
+        email=email,
         tz=settings.tz,
     )
     handler = UpdateHandler(client, orchestrator)
@@ -62,6 +83,7 @@ def build_components(settings: Settings) -> dict[str, Any]:
         "llm": llm,
         "store": store,
         "calendar": calendar,
+        "email": email,
         "orchestrator": orchestrator,
         "handler": handler,
         "poller": Poller(client, handler),

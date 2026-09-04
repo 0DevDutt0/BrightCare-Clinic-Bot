@@ -3,9 +3,9 @@
 A conversational agent that answers questions about a fictional clinic and books
 appointments over Telegram, backed by Google Calendar with an email confirmation.
 
-**Phase 1 of 5 — the routing layer.** Intent classification, conversation state, and
-both Telegram transports are complete. Calendar and email are typed interfaces awaiting
-Phases 3 and 4.
+**Phases 1–2 of 5 complete.** Intent classification, datetime resolution,
+business-hours validation, conversation state, and both Telegram transports are done.
+Calendar and email are typed interfaces awaiting Phases 3 and 4.
 
 ## Quick start
 
@@ -62,9 +62,13 @@ backoff, so a bug that reliably 500s becomes a retry storm that outlives the dep
 ```
 Step 0  message shape      non-text, /start, /help, empty      no model call, ever
 Step 1  conversation state stage != idle → active flow owns it  no model call
-Step 2  intent             one Groq call, temperature 0, JSON   the only model call
+Step 2  intent (Layer 1)   one Groq call, temperature 0, JSON
 Step 3  dispatch           greeting | faq | booking | out_of_scope
+          └─ booking only: Layer 2 resolves the time phrase     second Groq call
 ```
+
+Greetings, FAQs and refusals cost exactly one call. Booking costs two. A message that
+never reaches Step 2 costs none.
 
 **Step 1 before Step 2 is the load-bearing decision.** If the bot has asked "is 2pm
 alright?" and the user replies "yes", classifying that message in isolation returns
@@ -74,8 +78,29 @@ message; the words alone cannot. A deterministic escape hatch (`cancel`, `stop`,
 in-flow message.
 
 Layer 1 captures the time phrase **verbatim** (`"Monday at 2pm"`) and does not resolve
-it. Resolution belongs in Phase 2, where the timezone and business-hours context needed
-to interpret "tomorrow" actually exists.
+it. Layer 2 does that, with the current date and time injected into its prompt — which
+is the whole reason the layers are separate. "Tomorrow" is meaningless at classification
+time, when the message is being sorted rather than scheduled.
+
+### Two layers, split by what each is trusted with
+
+| | resolves | decides |
+|---|---|---|
+| **Layer 2** (`agent/resolver.py`) | words → a date and clock time | nothing |
+| **Scheduling** (`domain/scheduling.py`) | nothing | whether that time is bookable |
+
+The model is never told the opening hours, and a test asserts the prompt doesn't mention
+them. A model that misreads "Monday" produces a wrong *date* the user can see and
+correct; a model trusted with policy produces a wrong *rule* they cannot.
+
+Validation refuses rather than reroutes. Weekends, past dates, and after-hours requests
+are declined with an explanation — `next_open_day` only ever *suggests* an alternative,
+because `NEAREST_AVAILABLE_RULE` forbids rolling a booking onto another day. Within a
+day it does move forward: 14:15 becomes 14:30 (always rounding up, never offering a slot
+before the one asked for), and asking for 9am at 11:30 offers 11:30 with the reason
+stated. A silent shift is how a patient turns up an hour out.
+
+Full assumption list in `prompts/02-datetime-resolution.md`.
 
 Below `confidence < 0.6` the bot asks a clarifying question instead of acting on a
 guess. On a timeout, malformed JSON, or schema mismatch it replies gracefully and logs
@@ -95,6 +120,15 @@ change when that lands.
 
 **The OpenAI SDK's own retries are disabled** (`max_retries=0`). Left on, the required
 "one retry" silently becomes several, multiplying the wall-clock time a user waits.
+
+**`max_tokens` is 1024, and the reason is not obvious.** Reasoning models spend hidden
+reasoning tokens *inside* that budget before writing any answer — measured at 346–376
+on this task. The original 300 left no room for the JSON, and Groq rejected the call
+with HTTP 400 `json_validate_failed` and an empty `failed_generation`. It failed on
+exactly the inputs a classifier most needs to get right ("2:15 on Monday", "7pm on
+Tuesday") and passed on easy ones, so it presented as flakiness. No unit test could
+catch it, since every test fakes the model; `tests/test_llm.py` asserts the floor and
+records why.
 
 **Naive datetimes raise at construction** rather than being caught by convention. A
 naive value that reaches Phase 3's slot search either raises deep in the call stack or,
@@ -118,9 +152,14 @@ is held at WARNING because its INFO request line contains the bot token.
 venv/Scripts/python -m pytest
 ```
 
-110 tests, Groq faked at the `complete_json` seam — the narrowest point that still
+194 tests, Groq faked at the `complete_json` seam — the narrowest point that still
 exercises parsing, validation and error handling. Several assert work *not* done: a
-sticker costs zero model calls, and a mid-flow reply skips the classifier entirely.
+sticker costs zero model calls, a mid-flow reply skips the classifier entirely, and a
+booking with no time phrase never reaches Layer 2.
+
+Verified by mutation, not just by passing: rounding slots down, dropping the weekend
+check, rolling a late request to the next day, acting on a low-confidence resolution,
+or leaving a placeholder unsubstituted in a prompt each turns the suite red.
 
 ## Layout
 
@@ -130,9 +169,11 @@ app/
   logging_config.py    JSON logs, secret redaction
   main.py              FastAPI, lifespan, /health, webhook route
   telegram/            client, handle_update entrypoint, polling runner
-  agent/               llm, router (Layer 1), orchestrator, prompts, handlers/
+  agent/               llm, router (Layer 1), resolver (Layer 2), orchestrator,
+                       prompts, handlers/
   state/               ConversationState, StateStore + InMemoryStateStore
   domain/business.py   clinic facts, hours, slot grid, booking rule
+  domain/scheduling.py business-hours validation, slot alignment
   services/            calendar + email interfaces (Phases 3-4)
 prompts/               the prompt driving each phase
 tests/
@@ -143,7 +184,7 @@ tests/
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Scaffold, transports, routing layer | complete |
-| 2 | Datetime resolution, business-hours validation | not started |
+| 2 | Datetime resolution, business-hours validation | complete |
 | 3 | Calendar availability, slot search, event creation | interface only |
 | 4 | Email confirmation | interface only |
 | 5 | Deployment | not started |

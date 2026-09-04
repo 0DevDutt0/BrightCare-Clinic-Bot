@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, time
 
 import pytest
@@ -14,7 +15,7 @@ from app.agent.handlers.booking import (
     booking_reply,
 )
 from app.agent.llm import LLMError
-from app.agent.prompts import build_resolver_prompt
+from app.agent.prompts import INTENT_CLASSIFIER_PROMPT, build_resolver_prompt
 from app.agent.resolver import (
     MIN_RESOLUTION_CONFIDENCE,
     DatetimeResolver,
@@ -127,8 +128,37 @@ def test_the_prompt_carries_the_reference_moment() -> None:
     prompt = build_resolver_prompt(FIXED_NOW)
 
     assert "2026-09-04" in prompt
+    assert "11:30" in prompt
     assert "Friday" in prompt
     assert "Asia/Kolkata" in prompt
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [build_resolver_prompt(FIXED_NOW), INTENT_CLASSIFIER_PROMPT],
+    ids=["resolver", "classifier"],
+)
+def test_no_placeholder_survives_into_a_prompt(prompt: str) -> None:
+    """A missed substitution ships "__TODAY__" to the model as literal text.
+
+    Asserting on the substituted *values* is not enough: two placeholders can expand
+    to overlapping text, so one can be missed while the other still satisfies the
+    check. Assert the marker syntax is gone instead.
+    """
+    leftovers = re.findall(r"__[A-Z_]+__", prompt)
+
+    assert leftovers == []
+
+
+def test_the_resolver_prompt_uses_each_substitution() -> None:
+    """Guards the opposite failure: a placeholder silently dropped from the template."""
+    early = build_resolver_prompt(datetime(2026, 9, 4, 9, 0, tzinfo=TZ))
+    late = build_resolver_prompt(datetime(2026, 12, 25, 16, 45, tzinfo=TZ))
+
+    assert early != late
+    assert "09:00" in early and "16:45" in late
+    assert "Friday" in early and "Friday" in late  # 2026-12-25 is also a Friday
+    assert "2026-12-25" in late
 
 
 def test_the_prompt_does_not_leak_opening_hours() -> None:

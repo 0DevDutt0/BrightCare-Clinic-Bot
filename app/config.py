@@ -216,11 +216,14 @@ class Settings(BaseSettings):
         }
 
 
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    """Load settings once per process, converting pydantic errors into named keys."""
+def load_settings(**overrides: Any) -> Settings:
+    """Build Settings, converting pydantic errors into ones that name the env var.
+
+    Uncached and parameterised so the failure paths can be tested directly;
+    :func:`get_settings` is the cached entrypoint the app uses.
+    """
     try:
-        return Settings()  # type: ignore[call-arg]  # values come from env/.env
+        return Settings(**overrides)  # type: ignore[arg-type]  # values come from env/.env
     except ValidationError as exc:
         missing = sorted(
             {
@@ -241,3 +244,9 @@ def get_settings() -> Settings:
             for error in exc.errors()
         )
         raise ConfigurationError(f"Invalid configuration -- {details}") from exc
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Load settings once per process."""
+    return load_settings()

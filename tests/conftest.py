@@ -21,6 +21,8 @@ from app.agent.llm import LLMError
 from app.agent.orchestrator import Orchestrator
 from app.agent.resolver import DatetimeResolver
 from app.agent.router import IntentRouter
+from app.domain.business import SLOT_DURATION, slot_starts
+from app.services.calendar_service import CalendarService
 from app.state.store import InMemoryStateStore
 from app.telegram.handler import UpdateHandler
 
@@ -60,6 +62,80 @@ class FakeGroqClient:
         if not self._responses:
             raise LLMError("FakeGroqClient has no queued response")
         return self._responses.pop(0)
+
+
+class FakeCalendarService(CalendarService):
+    """In-memory calendar with real slot-grid behaviour.
+
+    Busy times are given as the slot starts that are taken, so a test reads as
+    "14:00 is booked" rather than as a list of RFC 3339 intervals. Availability is
+    computed from the same domain helpers the live service uses, so a test that
+    passes here is testing the rule, not a hand-written answer.
+    """
+
+    def __init__(
+        self,
+        busy: set[datetime] | None = None,
+        error: Exception | None = None,
+        tz: ZoneInfo = TZ,
+    ) -> None:
+        self.busy = set(busy or ())
+        self.error = error
+        self.tz = tz
+        self.created: list[dict[str, Any]] = []
+        # Slots that fall away between proposing and confirming, to exercise the race.
+        self.taken_on_next_check: set[datetime] = set()
+        self.calls: list[str] = []
+
+    def _guard(self, call: str) -> None:
+        self.calls.append(call)
+        if self.error is not None:
+            raise self.error
+
+    async def list_busy(
+        self, window_start: datetime, window_end: datetime
+    ) -> list[tuple[datetime, datetime]]:
+        self._guard("list_busy")
+        return [
+            (slot, slot + SLOT_DURATION)
+            for slot in sorted(self.busy)
+            if slot < window_end and slot + SLOT_DURATION > window_start
+        ]
+
+    async def find_nearest_available(self, requested_start: datetime) -> datetime | None:
+        self._guard("find_nearest_available")
+        day = requested_start.astimezone(self.tz).date()
+        for slot in slot_starts(day, self.tz):
+            if slot >= requested_start and slot not in self.busy:
+                return slot
+        return None
+
+    async def is_free(self, start: datetime) -> bool:
+        self._guard("is_free")
+        if start in self.taken_on_next_check:
+            self.busy.add(start)
+            self.taken_on_next_check.discard(start)
+            return False
+        return start not in self.busy
+
+    async def create_event(
+        self,
+        start: datetime,
+        summary: str,
+        description: str = "",
+        attendee_email: str | None = None,
+    ) -> str:
+        self._guard("create_event")
+        self.busy.add(start)
+        self.created.append(
+            {
+                "start": start,
+                "summary": summary,
+                "description": description,
+                "attendee_email": attendee_email,
+            }
+        )
+        return f"evt-{len(self.created)}"
 
 
 class FakeTelegramClient:
@@ -154,13 +230,23 @@ def store() -> InMemoryStateStore:
 
 
 @pytest.fixture
-def orchestrator(fake_llm: FakeGroqClient, store: InMemoryStateStore) -> Orchestrator:
+def calendar() -> FakeCalendarService:
+    return FakeCalendarService()
+
+
+@pytest.fixture
+def orchestrator(
+    fake_llm: FakeGroqClient,
+    store: InMemoryStateStore,
+    calendar: FakeCalendarService,
+) -> Orchestrator:
     """Both layers share one fake client, so queued responses are consumed in order:
     the classification first, then the resolution if the booking path reaches it."""
     return Orchestrator(
         router=IntentRouter(fake_llm),
         store=store,
         resolver=DatetimeResolver(fake_llm),
+        calendar=calendar,
         tz=TZ,
         now=lambda: FIXED_NOW,
     )

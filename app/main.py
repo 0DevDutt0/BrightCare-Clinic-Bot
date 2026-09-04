@@ -21,6 +21,7 @@ from app.agent.resolver import DatetimeResolver
 from app.agent.router import IntentRouter
 from app.config import Settings, get_settings
 from app.logging_config import configure_logging
+from app.services.calendar_service import GoogleCalendarService
 from app.state.store import InMemoryStateStore
 from app.telegram.client import TelegramClient, TelegramError
 from app.telegram.handler import UpdateHandler
@@ -42,11 +43,17 @@ def build_components(settings: Settings) -> dict[str, Any]:
         timeout=settings.groq_timeout_seconds,
     )
     store = InMemoryStateStore()
+    calendar = GoogleCalendarService(
+        service_account_info=settings.service_account_info,
+        calendar_id=settings.google_calendar_id,
+        tz=settings.tz,
+    )
     # Both layers share one client: same model, same retry policy, one connection pool.
     orchestrator = Orchestrator(
         router=IntentRouter(llm),
         store=store,
         resolver=DatetimeResolver(llm),
+        calendar=calendar,
         tz=settings.tz,
     )
     handler = UpdateHandler(client, orchestrator)
@@ -54,6 +61,7 @@ def build_components(settings: Settings) -> dict[str, Any]:
         "client": client,
         "llm": llm,
         "store": store,
+        "calendar": calendar,
         "orchestrator": orchestrator,
         "handler": handler,
         "poller": Poller(client, handler),
@@ -96,6 +104,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.run_mode == "polling":
             await components["poller"].stop()
         await components["llm"].aclose()
+        await components["calendar"].aclose()
         await client.aclose()
 
 

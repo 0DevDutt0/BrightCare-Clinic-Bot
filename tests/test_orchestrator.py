@@ -6,7 +6,6 @@ from datetime import datetime
 
 import pytest
 
-from app.agent.handlers.booking import NOT_WIRED_YET
 from app.agent.handlers.faq import TOPIC_PROMPT
 from app.agent.orchestrator import (
     CLARIFY_MESSAGE,
@@ -21,7 +20,14 @@ from app.agent.router import IntentRouter
 from app.domain.business import CLINIC_ADDRESS, FAQ_FACTS, WELCOME
 from app.state.models import ConversationState
 
-from tests.conftest import FIXED_NOW, TZ, FakeGroqClient, classification, resolution
+from tests.conftest import (
+    FIXED_NOW,
+    TZ,
+    FakeCalendarService,
+    FakeGroqClient,
+    classification,
+    resolution,
+)
 
 CHAT_ID = 555
 
@@ -84,11 +90,12 @@ async def test_booking_resolves_the_phrase_and_stores_the_slot(
     reply = await orchestrator.handle(CHAT_ID, {"text": "can I book Monday at 2pm?"})
 
     assert "Monday 7 September at 2:00 PM" in reply.text
-    assert NOT_WIRED_YET in reply.text
+    assert "Shall I book it?" in reply.text
 
     state = await store.get(CHAT_ID)
     assert state.raw_datetime_text == "Monday at 2pm"
     assert state.requested_start == datetime(2026, 9, 7, 14, 0, tzinfo=TZ)
+    assert state.proposed_start == datetime(2026, 9, 7, 14, 0, tzinfo=TZ)
 
 
 async def test_booking_costs_exactly_two_model_calls(
@@ -115,12 +122,24 @@ async def test_booking_without_a_time_phrase_skips_layer_two(
     assert "What day and time" in reply.text
 
 
-async def test_booking_stub_leaves_the_conversation_idle(
+async def test_a_successful_proposal_opens_the_confirmation_stage(
     orchestrator: Orchestrator, fake_llm: FakeGroqClient, store
 ) -> None:
-    """Phase 2 must not park the user in a flow that cannot advance."""
+    """Phase 3 does park the user in a flow -- because there is now one to advance."""
+    fake_llm.queue(classification("booking", raw_datetime_text="Monday at 2pm"))
+    fake_llm.queue(resolution("2026-09-07", "14:00"))
+
+    await orchestrator.handle(CHAT_ID, {"text": "book me Monday at 2pm"})
+
+    assert (await store.get(CHAT_ID)).stage == "awaiting_slot_confirmation"
+
+
+async def test_a_rejected_request_leaves_the_conversation_idle(
+    orchestrator: Orchestrator, fake_llm: FakeGroqClient, store
+) -> None:
+    """Saturday is refused, so there is no flow to be stuck in."""
     fake_llm.queue(classification("booking", raw_datetime_text="tomorrow"))
-    fake_llm.queue(resolution("2026-09-05", None))
+    fake_llm.queue(resolution("2026-09-05", None))  # Saturday
 
     await orchestrator.handle(CHAT_ID, {"text": "book me tomorrow"})
 
@@ -256,6 +275,7 @@ async def test_llm_transport_failure_falls_back_without_raising(
         router=IntentRouter(failing),
         store=store,
         resolver=DatetimeResolver(failing),
+        calendar=FakeCalendarService(),
         tz=TZ,
         now=lambda: FIXED_NOW,
     )

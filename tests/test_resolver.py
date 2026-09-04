@@ -8,12 +8,7 @@ from datetime import date, datetime, time
 
 import pytest
 
-from app.agent.handlers.booking import (
-    ASK_FOR_TIME,
-    NOT_WIRED_YET,
-    TROUBLE_RESOLVING,
-    booking_reply,
-)
+from app.agent.handlers.booking import ASK_FOR_TIME, TROUBLE_RESOLVING, start_booking
 from app.agent.llm import LLMError
 from app.agent.prompts import INTENT_CLASSIFIER_PROMPT, build_resolver_prompt
 from app.agent.resolver import (
@@ -24,7 +19,13 @@ from app.agent.resolver import (
 )
 from app.state.models import ConversationState
 
-from tests.conftest import FIXED_NOW, TZ, FakeGroqClient, resolution
+from tests.conftest import (
+    FIXED_NOW,
+    TZ,
+    FakeCalendarService,
+    FakeGroqClient,
+    resolution,
+)
 
 
 # --------------------------------------------------------------- parsing
@@ -176,24 +177,28 @@ async def _reply(queued: object, phrase: str | None = "Monday at 2pm") -> str:
     if queued is not None:
         llm.queue(queued)  # type: ignore[arg-type]
     state = ConversationState(chat_id=1)
-    return await booking_reply(state, phrase, DatetimeResolver(llm), FIXED_NOW, TZ)
+    return await start_booking(
+        state, phrase, DatetimeResolver(llm), FakeCalendarService(), FIXED_NOW, TZ
+    )
 
 
 async def test_no_time_phrase_asks_for_one_without_calling_the_model() -> None:
     llm = FakeGroqClient()
     state = ConversationState(chat_id=1)
 
-    reply = await booking_reply(state, None, DatetimeResolver(llm), FIXED_NOW, TZ)
+    reply = await start_booking(
+        state, None, DatetimeResolver(llm), FakeCalendarService(), FIXED_NOW, TZ
+    )
 
     assert reply == ASK_FOR_TIME
     assert llm.call_count == 0
 
 
-async def test_a_bookable_time_is_confirmed_in_words() -> None:
+async def test_a_bookable_time_is_offered_for_confirmation() -> None:
     reply = await _reply(resolution("2026-09-07", "14:00"))
 
     assert "Monday 7 September at 2:00 PM" in reply
-    assert NOT_WIRED_YET in reply
+    assert "Shall I book it?" in reply
 
 
 async def test_an_adjusted_time_says_so() -> None:
@@ -241,8 +246,9 @@ async def test_a_resolver_failure_degrades_gracefully() -> None:
     llm = FakeGroqClient(error=LLMError("groq down"))
     state = ConversationState(chat_id=1)
 
-    reply = await booking_reply(
-        state, "Monday at 2pm", DatetimeResolver(llm), FIXED_NOW, TZ
+    reply = await start_booking(
+        state, "Monday at 2pm", DatetimeResolver(llm),
+        FakeCalendarService(), FIXED_NOW, TZ
     )
 
     assert reply == TROUBLE_RESOLVING
@@ -253,9 +259,11 @@ async def test_a_bookable_slot_is_stored_as_an_aware_datetime() -> None:
     llm.queue(resolution("2026-09-07", "14:00"))
     state = ConversationState(chat_id=1)
 
-    await booking_reply(state, "Monday at 2pm", DatetimeResolver(llm), FIXED_NOW, TZ)
+    await start_booking(state, "Monday at 2pm", DatetimeResolver(llm),
+                        FakeCalendarService(), FIXED_NOW, TZ)
 
     assert state.requested_start == datetime(2026, 9, 7, 14, 0, tzinfo=TZ)
+    assert state.proposed_start == datetime(2026, 9, 7, 14, 0, tzinfo=TZ)
     assert state.requested_start.tzinfo is not None
 
 
@@ -264,6 +272,8 @@ async def test_a_rejected_request_stores_no_slot() -> None:
     llm.queue(resolution("2026-09-05", "10:00"))  # Saturday
     state = ConversationState(chat_id=1)
 
-    await booking_reply(state, "Saturday at 10", DatetimeResolver(llm), FIXED_NOW, TZ)
+    await start_booking(state, "Saturday at 10", DatetimeResolver(llm),
+                        FakeCalendarService(), FIXED_NOW, TZ)
 
     assert state.requested_start is None
+    assert state.stage == "idle"

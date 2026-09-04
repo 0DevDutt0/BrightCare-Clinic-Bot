@@ -26,13 +26,14 @@ from datetime import datetime
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from app.agent.handlers.booking import booking_reply, continue_booking_flow
+from app.agent.handlers.booking import continue_booking, start_booking
 from app.agent.handlers.faq import faq_reply
 from app.agent.handlers.greeting import greeting_reply
 from app.agent.handlers.out_of_scope import out_of_scope_reply
 from app.agent.resolver import DatetimeResolver
 from app.agent.router import IntentRouter, RoutingError
 from app.domain.business import CAPABILITIES, WELCOME
+from app.services.calendar_service import CalendarService
 from app.state.store import StateStore
 
 logger = logging.getLogger(__name__)
@@ -83,12 +84,14 @@ class Orchestrator:
         router: IntentRouter,
         store: StateStore,
         resolver: DatetimeResolver,
+        calendar: CalendarService,
         tz: ZoneInfo,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._router = router
         self._store = store
         self._resolver = resolver
+        self._calendar = calendar
         self._tz = tz
         # Injectable so "tomorrow at 3pm" can be tested against a fixed reference
         # instead of whatever day the suite happens to run on.
@@ -127,23 +130,41 @@ class Orchestrator:
 
         state = await self._store.get(chat_id)
         state.add_turn("user", stripped)
+        # Telegram already knows who this is; asking would be a wasted turn.
+        # Never logged: it is the one piece of personal data in the flow.
+        sender_name = (message.get("from") or {}).get("first_name")
+        if isinstance(sender_name, str) and sender_name.strip():
+            state.patient_name = sender_name.strip()
 
         # --- Step 1: active flow owns the message ------------------------------
         if state.is_active:
             stage = state.stage
             if stripped.lower() in ESCAPE_PHRASES:
                 state.reset_flow()
-                reply = Reply(FLOW_CLEARED, "flow_cleared")
                 logger.info(
                     "orchestrator.flow_cleared", extra={"chat_id": chat_id, "stage": stage}
                 )
-            else:
-                reply = Reply(continue_booking_flow(state), f"continuation.{stage}")
+                return await self._finish(state, Reply(FLOW_CLEARED, "flow_cleared"))
+
+            flow_reply = await continue_booking(
+                state, stripped, self._calendar, self._now(), self._tz
+            )
+            if flow_reply is not None:
                 logger.info(
                     "orchestrator.continuation",
                     extra={"chat_id": chat_id, "stage": stage},
                 )
-            return await self._finish(state, reply)
+                return await self._finish(
+                    state, Reply(flow_reply, f"continuation.{stage}")
+                )
+
+            # The reply did not answer the question that was asked -- most likely a
+            # different time. continue_booking has already cleared the flow, so fall
+            # through and let the router read it as a fresh request.
+            logger.info(
+                "orchestrator.flow_reclassify",
+                extra={"chat_id": chat_id, "stage": stage},
+            )
 
         # --- Step 2: classify --------------------------------------------------
         try:
@@ -170,10 +191,11 @@ class Orchestrator:
         elif intent == "faq":
             text_out = faq_reply(classification.faq_topic)
         elif intent == "booking":
-            text_out = await booking_reply(
+            text_out = await start_booking(
                 state,
                 classification.raw_datetime_text,
                 self._resolver,
+                self._calendar,
                 self._now(),
                 self._tz,
             )

@@ -5,3 +5,10 @@ pydantic-settings==2.15.0
 openai==3.8.0
 httpx==0.28.1
 tzdata==2026.3
+# Signs the service-account JWT. Installed WITHOUT the [requests] extra: its default
+# transport would pull in a second HTTP stack, so app/services/calendar_service.py
+# supplies an httpx one instead.
+google-auth==2.57.1
+# Backs pydantic's EmailStr. A bad address means the confirmation silently never
+# arrives, which is worth more than a hand-rolled regex.
+email-validator==2.3.0

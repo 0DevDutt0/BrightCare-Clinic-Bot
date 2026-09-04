@@ -28,8 +28,11 @@ _RESERVED = frozenset(
     stack_info taskName thread threadName""".split()
 )
 
-# Fields that may carry text a user typed. Emails are stripped from these at INFO+.
-_USER_CONTENT_FIELDS = frozenset({"text", "user_text", "reply", "message_text"})
+# Fields that may carry text a user typed, directly or echoed back by the model.
+# Emails are stripped from these at INFO and above.
+_USER_CONTENT_FIELDS = frozenset(
+    {"text", "user_text", "reply", "message_text", "raw_output", "llm_output"}
+)
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 

@@ -1,0 +1,59 @@
+# Render blueprint. One concrete host so deployment is a click rather than a project;
+# the Dockerfile is host-agnostic, so Railway or Fly work equally well without this.
+#
+# A *web service* is chosen over a background worker because the free tier sleeps when
+# idle, and a sleeping worker cannot poll. Webhook mode wakes the service on the
+# inbound request itself, which is the whole reason both transports exist.
+services:
+  - type: web
+    name: brightcare-clinic-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore          # nearest to Asia/Kolkata; cuts a round trip off every reply
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      # Set at deploy time. RUN_MODE must be webhook here: see the note above.
+      - key: RUN_MODE
+        value: webhook
+
+      # PUBLIC_BASE_URL is the chicken-and-egg one. The URL does not exist until the
+      # service is created, so deploy once, copy the assigned URL, set this, redeploy.
+      - key: PUBLIC_BASE_URL
+        sync: false
+
+      # sync: false means "prompt me, never store this in the repo".
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GOOGLE_CALENDAR_ID
+        sync: false
+      # Paste the one-line JSON here. The FILE variant is not used in deployment:
+      # there is no credentials/ directory in the image, by design.
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: FROM_EMAIL
+        sync: false
+
+      # Safe to commit: no secrets, and identical across environments.
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: FROM_NAME
+        value: BrightCare Clinic
+      - key: TIMEZONE
+        value: Asia/Kolkata
+      - key: LOG_LEVEL
+        value: INFO

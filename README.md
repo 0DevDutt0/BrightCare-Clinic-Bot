@@ -3,11 +3,11 @@
 A conversational agent that answers questions about a fictional clinic and books
 appointments over Telegram, backed by Google Calendar with an email confirmation.
 
-**Phases 1–4 of 5 complete.** The bot books real appointments on a real Google
+**Phases 1–5 of 5 complete.** The bot books real appointments on a real Google
 Calendar and emails the patient a confirmation with a calendar attachment. Intent
 classification, datetime resolution, business-hours validation, availability search,
 event creation, SMTP confirmation, conversation state and both Telegram transports are
-done. Only deployment (Phase 5) remains.
+done, and the app ships as a container with CI.
 
 ## Quick start
 
@@ -196,6 +196,68 @@ states which of the two happened rather than promising a confirmation that never
 impossible, that file is the only route the appointment has into the patient's own
 calendar.
 
+## Deployment
+
+The image is host-agnostic; `render.yaml` is one worked example, not a requirement.
+
+```bash
+docker build -t brightcare-clinic-bot .
+docker run -p 8000:8000 --env-file .env brightcare-clinic-bot
+```
+
+### Choose the service type first — it decides everything else
+
+| host service type | `RUN_MODE` | why |
+|---|---|---|
+| background worker / always-on | `polling` | no public URL needed; simplest |
+| free-tier **web** service | `webhook` | free tiers sleep when idle, and a sleeping worker cannot poll — the inbound request is what wakes it |
+
+`render.yaml` picks a web service on the free plan, so it sets `RUN_MODE=webhook`.
+
+### The chicken-and-egg step
+
+`PUBLIC_BASE_URL` cannot be set before the service exists, because the host assigns the
+URL. So:
+
+1. Deploy once. It boots, `set_webhook` fails, `/health` still answers — by design.
+2. Copy the assigned URL into `PUBLIC_BASE_URL`.
+3. Redeploy. Startup registers the webhook itself; no manual `setWebhook` needed.
+
+Startup refuses to run in webhook mode without `PUBLIC_BASE_URL` *and*
+`TELEGRAM_WEBHOOK_SECRET`, so a half-configured deploy fails immediately with a message
+naming the missing key rather than going quietly deaf.
+
+### Environment variables in production
+
+Set them in the host dashboard — never upload `.env`, and note that `.dockerignore`
+excludes it so it cannot reach an image layer either. Paste
+`GOOGLE_SERVICE_ACCOUNT_JSON` as the one-line JSON; `GOOGLE_SERVICE_ACCOUNT_FILE` is
+not used in deployment, since the image has no `credentials/` directory by design.
+
+### One worker, deliberately
+
+`--workers 1` is pinned in the Dockerfile. Conversation state lives in memory, so a
+second worker is a second process with its own view of every conversation: a user could
+be asked for their email by one worker and have the reply land on another that has never
+heard of them. State also does not survive a restart, which free tiers do often — an
+in-flight booking is lost, though a *completed* one is safe on the calendar. Both are
+fixed by the same thing: the Redis backend the `StateStore` interface already allows.
+
+### CI
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+- **test** — the full suite with no secrets, because every external service is faked
+- **secrets** — greps tracked files for credential shapes, and fails if `.env` or
+  `credentials/` stops being ignored. The PEM pattern requires real key material after
+  the marker, so test fixtures containing `BEGIN PRIVATE KEY-----
+notarealkey` do not
+  trip it; a scanner that cries wolf is one that gets disabled
+- **build** — builds the image, generates a throwaway RSA key (a placeholder string
+  will not do: config resolves credentials eagerly and google-auth rejects a fake PEM),
+  starts the container, and asserts `/health` answers, that it runs unprivileged, and
+  that no `.env` is baked in
+
 ## Secrets
 
 `.env` and `credentials/` are gitignored. Secrets are `SecretStr` and the service
@@ -252,4 +314,4 @@ tests/
 | 2 | Datetime resolution, business-hours validation | complete |
 | 3 | Calendar availability, slot search, event creation | complete |
 | 4 | Email confirmation | complete |
-| 5 | Deployment | not started |
+| 5 | Deployment | complete |

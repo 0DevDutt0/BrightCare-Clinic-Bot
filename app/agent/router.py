@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from app.agent.llm import GroqClient, LLMError
+from app.agent.llm import GroqClient, LLMError, strip_code_fences
 from app.agent.prompts import INTENT_CLASSIFIER_PROMPT
 from app.domain.business import FAQ_FACTS
 
@@ -71,17 +71,6 @@ class Classification(BaseModel):
         return self.confidence >= MIN_CONFIDENCE
 
 
-def _strip_code_fences(raw: str) -> str:
-    """Unwrap ```json ... ``` if the model added it despite JSON mode."""
-    text = raw.strip()
-    if not text.startswith("```"):
-        return text
-    body = text[3:]
-    if body.lower().startswith("json"):
-        body = body[4:]
-    return body.rsplit("```", 1)[0].strip() if "```" in body else body.strip()
-
-
 class IntentRouter:
     """Turns a user message into a :class:`Classification`."""
 
@@ -98,7 +87,7 @@ class IntentRouter:
         raw = ""
         try:
             raw = await self._llm.complete_json(INTENT_CLASSIFIER_PROMPT, message)
-            payload = json.loads(_strip_code_fences(raw))
+            payload = json.loads(strip_code_fences(raw))
             classification = Classification.model_validate(payload)
         except LLMError as exc:
             logger.warning("router.llm_failed", extra={"error": str(exc)}, exc_info=True)

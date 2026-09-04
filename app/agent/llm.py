@@ -32,6 +32,22 @@ class LLMError(RuntimeError):
     """The model could not be reached, or returned nothing usable."""
 
 
+def strip_code_fences(raw: str) -> str:
+    """Unwrap ```json ... ``` if the model added it despite JSON mode.
+
+    Shared by both LLM layers: JSON mode should make this unnecessary, but models
+    still wrap output often enough that six defensive lines are cheaper than the
+    intermittent parse failures they prevent.
+    """
+    text = raw.strip()
+    if not text.startswith("```"):
+        return text
+    body = text[3:]
+    if body.lower().startswith("json"):
+        body = body[4:]
+    return body.rsplit("```", 1)[0].strip() if "```" in body else body.strip()
+
+
 class GroqClient:
     """JSON-mode chat completions with a hard timeout and one retry."""
 

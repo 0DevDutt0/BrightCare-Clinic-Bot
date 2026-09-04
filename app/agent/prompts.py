@@ -9,6 +9,8 @@ constants verbatim -- see :mod:`app.agent.handlers.faq` for why.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from app.domain.business import CLINIC_NAME, FAQ_FACTS
 
 _TOPICS = " | ".join(f'"{topic}"' for topic in FAQ_FACTS)
@@ -77,3 +79,70 @@ message: "ok"
 INTENT_CLASSIFIER_PROMPT = _CLASSIFIER_TEMPLATE.replace("__CLINIC__", CLINIC_NAME).replace(
     "__TOPICS__", _TOPICS
 )
+
+
+# --------------------------------------------------------------------- LAYER 2
+
+# Resolution needs a reference point, so "today" is injected per call rather than
+# baked in. The model is asked only to turn words into a date and a clock time; it is
+# never told the opening hours, because whether that time is *bookable* is decided by
+# app.domain.scheduling, not here.
+_RESOLVER_TEMPLATE = """\
+You convert a time phrase into a calendar date and a clock time. Reply with a single
+JSON object and nothing else.
+
+Right now it is __NOW__ (__WEEKDAY__), time zone __TZ__.
+
+Return these fields:
+{
+  "date": "YYYY-MM-DD" or null,
+  "time": "HH:MM" in 24-hour form, or null,
+  "confidence": a number from 0.0 to 1.0
+}
+
+Rules:
+- Resolve every relative phrase against the current date and time above.
+- "today" is __TODAY__. "tomorrow" is the next calendar day.
+- A bare weekday name means the NEXT occurrence of that weekday, strictly after
+  today, unless the phrase says "today". "next Monday" also means that occurrence.
+- Parts of the day map to fixed clock times:
+  morning -> 09:00, noon or midday -> 12:00, afternoon -> 14:00, evening -> 17:00.
+- If the phrase names a day but no time at all, set "time" to null. Do not guess one.
+- If the phrase names no resolvable day, set "date" to null. Vague phrases such as
+  "sometime", "soon", "later" or "whenever" have no date -- return null, do not
+  invent one.
+- A time with no day means today: "at 3pm" on __TODAY__ is __TODAY__ at 15:00.
+- "confidence" must be below 0.6 when the phrase could reasonably mean more than one
+  date, such as "next week" or "the 5th" with no month.
+- Never mention opening hours, availability or whether the date is sensible. Resolve
+  the words only.
+
+Examples, assuming right now is Friday 2026-09-04 at 11:30:
+phrase: "Monday at 2pm"
+{"date": "2026-09-07", "time": "14:00", "confidence": 0.97}
+
+phrase: "tomorrow morning"
+{"date": "2026-09-05", "time": "09:00", "confidence": 0.95}
+
+phrase: "next Tuesday"
+{"date": "2026-09-08", "time": null, "confidence": 0.92}
+
+phrase: "at 3pm"
+{"date": "2026-09-04", "time": "15:00", "confidence": 0.94}
+
+phrase: "the 15th at 10:30"
+{"date": "2026-09-15", "time": "10:30", "confidence": 0.9}
+
+phrase: "sometime soon"
+{"date": null, "time": null, "confidence": 0.2}
+"""
+
+
+def build_resolver_prompt(now: datetime) -> str:
+    """Layer 2 system prompt anchored to ``now`` (timezone-aware, clinic zone)."""
+    return (
+        _RESOLVER_TEMPLATE.replace("__NOW__", now.strftime("%Y-%m-%d %H:%M"))
+        .replace("__WEEKDAY__", now.strftime("%A"))
+        .replace("__TZ__", str(now.tzinfo))
+        .replace("__TODAY__", now.strftime("%Y-%m-%d"))
+    )

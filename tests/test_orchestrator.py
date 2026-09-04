@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from app.agent.handlers.booking import NOT_WIRED_YET
@@ -19,7 +21,7 @@ from app.agent.router import IntentRouter
 from app.domain.business import CLINIC_ADDRESS, FAQ_FACTS, WELCOME
 from app.state.models import ConversationState
 
-from tests.conftest import FakeGroqClient, classification
+from tests.conftest import FIXED_NOW, TZ, FakeGroqClient, classification, resolution
 
 CHAT_ID = 555
 
@@ -72,25 +74,53 @@ async def test_faq_without_topic_asks_which_topic(
     assert reply.text == TOPIC_PROMPT
 
 
-async def test_booking_echoes_and_stores_the_raw_time_phrase(
+async def test_booking_resolves_the_phrase_and_stores_the_slot(
     orchestrator: Orchestrator, fake_llm: FakeGroqClient, store
 ) -> None:
-    fake_llm.queue(
-        classification("booking", raw_datetime_text="Monday at 2pm")
-    )
+    """Layer 1 captures the phrase, Layer 2 resolves it, the slot lands in state."""
+    fake_llm.queue(classification("booking", raw_datetime_text="Monday at 2pm"))
+    fake_llm.queue(resolution("2026-09-07", "14:00"))
 
     reply = await orchestrator.handle(CHAT_ID, {"text": "can I book Monday at 2pm?"})
 
-    assert "Monday at 2pm" in reply.text
+    assert "Monday 7 September at 2:00 PM" in reply.text
     assert NOT_WIRED_YET in reply.text
-    assert (await store.get(CHAT_ID)).raw_datetime_text == "Monday at 2pm"
+
+    state = await store.get(CHAT_ID)
+    assert state.raw_datetime_text == "Monday at 2pm"
+    assert state.requested_start == datetime(2026, 9, 7, 14, 0, tzinfo=TZ)
+
+
+async def test_booking_costs_exactly_two_model_calls(
+    orchestrator: Orchestrator, fake_llm: FakeGroqClient
+) -> None:
+    """One to classify, one to resolve -- and no more."""
+    fake_llm.queue(classification("booking", raw_datetime_text="Monday at 2pm"))
+    fake_llm.queue(resolution("2026-09-07", "14:00"))
+
+    await orchestrator.handle(CHAT_ID, {"text": "can I book Monday at 2pm?"})
+
+    assert fake_llm.call_count == 2
+
+
+async def test_booking_without_a_time_phrase_skips_layer_two(
+    orchestrator: Orchestrator, fake_llm: FakeGroqClient
+) -> None:
+    """Nothing to resolve means no second call."""
+    fake_llm.queue(classification("booking", raw_datetime_text=None))
+
+    reply = await orchestrator.handle(CHAT_ID, {"text": "I'd like an appointment"})
+
+    assert fake_llm.call_count == 1
+    assert "What day and time" in reply.text
 
 
 async def test_booking_stub_leaves_the_conversation_idle(
     orchestrator: Orchestrator, fake_llm: FakeGroqClient, store
 ) -> None:
-    """Phase 1 must not park the user in a flow that cannot advance."""
+    """Phase 2 must not park the user in a flow that cannot advance."""
     fake_llm.queue(classification("booking", raw_datetime_text="tomorrow"))
+    fake_llm.queue(resolution("2026-09-05", None))
 
     await orchestrator.handle(CHAT_ID, {"text": "book me tomorrow"})
 
@@ -219,9 +249,16 @@ async def test_llm_transport_failure_falls_back_without_raising(
     store,
 ) -> None:
     from app.agent.llm import LLMError
+    from app.agent.resolver import DatetimeResolver
 
     failing = FakeGroqClient(error=LLMError("groq is down"))
-    subject = Orchestrator(IntentRouter(failing), store)
+    subject = Orchestrator(
+        router=IntentRouter(failing),
+        store=store,
+        resolver=DatetimeResolver(failing),
+        tz=TZ,
+        now=lambda: FIXED_NOW,
+    )
 
     reply = await subject.handle(CHAT_ID, {"text": "hello"})
 

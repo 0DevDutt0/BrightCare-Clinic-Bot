@@ -17,6 +17,7 @@ from fastapi import FastAPI, Request, Response
 
 from app.agent.llm import GroqClient
 from app.agent.orchestrator import Orchestrator
+from app.agent.resolver import DatetimeResolver
 from app.agent.router import IntentRouter
 from app.config import Settings, get_settings
 from app.logging_config import configure_logging
@@ -41,7 +42,13 @@ def build_components(settings: Settings) -> dict[str, Any]:
         timeout=settings.groq_timeout_seconds,
     )
     store = InMemoryStateStore()
-    orchestrator = Orchestrator(IntentRouter(llm), store)
+    # Both layers share one client: same model, same retry policy, one connection pool.
+    orchestrator = Orchestrator(
+        router=IntentRouter(llm),
+        store=store,
+        resolver=DatetimeResolver(llm),
+        tz=settings.tz,
+    )
     handler = UpdateHandler(client, orchestrator)
     return {
         "client": client,

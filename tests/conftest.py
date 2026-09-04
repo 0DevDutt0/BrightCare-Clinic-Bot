@@ -11,15 +11,25 @@ a sticker must cost zero model calls, and a mid-flow reply must skip the classif
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from app.agent.llm import LLMError
 from app.agent.orchestrator import Orchestrator
+from app.agent.resolver import DatetimeResolver
 from app.agent.router import IntentRouter
 from app.state.store import InMemoryStateStore
 from app.telegram.handler import UpdateHandler
+
+TZ = ZoneInfo("Asia/Kolkata")
+
+# Friday, mid-morning, mid-week: far enough from a weekend that "tomorrow" and
+# "Monday" are distinct, and inside opening hours so "today at 3pm" is bookable.
+# Tests read against this instead of the wall clock, so none of them rot.
+FIXED_NOW = datetime(2026, 9, 4, 11, 30, tzinfo=TZ)
 
 
 class FakeGroqClient:
@@ -98,6 +108,15 @@ def classification(
     }
 
 
+def resolution(
+    day: str | None = None,
+    clock: str | None = None,
+    confidence: float = 0.95,
+) -> dict[str, Any]:
+    """Build a well-formed Layer 2 payload (the model emits date/time, not day/clock)."""
+    return {"date": day, "time": clock, "confidence": confidence}
+
+
 def text_update(text: str, update_id: int = 1, chat_id: int = 555) -> dict[str, Any]:
     """A Telegram update carrying a text message."""
     return {
@@ -136,7 +155,15 @@ def store() -> InMemoryStateStore:
 
 @pytest.fixture
 def orchestrator(fake_llm: FakeGroqClient, store: InMemoryStateStore) -> Orchestrator:
-    return Orchestrator(IntentRouter(fake_llm), store)
+    """Both layers share one fake client, so queued responses are consumed in order:
+    the classification first, then the resolution if the booking path reaches it."""
+    return Orchestrator(
+        router=IntentRouter(fake_llm),
+        store=store,
+        resolver=DatetimeResolver(fake_llm),
+        tz=TZ,
+        now=lambda: FIXED_NOW,
+    )
 
 
 @pytest.fixture

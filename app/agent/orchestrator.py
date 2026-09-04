@@ -6,8 +6,12 @@ and only a message that survives all of them costs a classification:
   Step 0  message shape      -- non-text, commands, empty. No model call, ever.
   Step 1  conversation state -- a non-idle stage means the message belongs to an
                                 active flow and must not be re-classified.
-  Step 2  intent             -- one model call, temperature 0, JSON mode.
+  Step 2  intent (Layer 1)   -- one model call, temperature 0, JSON mode.
   Step 3  dispatch           -- one handler, chosen from the validated intent.
+
+Only the booking handler goes further, spending a second call on Layer 2 to resolve
+the time phrase. Greetings, FAQs and refusals cost exactly one call; a message that
+never reaches Step 2 costs none.
 
 Step 1 before Step 2 is the part that is easy to get wrong. If a user has been asked
 "is 2pm alright?" and replies "yes", classifying that message in isolation yields
@@ -18,12 +22,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime
+from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from app.agent.handlers.booking import booking_reply, continue_booking_flow
 from app.agent.handlers.faq import faq_reply
 from app.agent.handlers.greeting import greeting_reply
 from app.agent.handlers.out_of_scope import out_of_scope_reply
+from app.agent.resolver import DatetimeResolver
 from app.agent.router import IntentRouter, RoutingError
 from app.domain.business import CAPABILITIES, WELCOME
 from app.state.store import StateStore
@@ -71,9 +78,21 @@ class Reply:
 class Orchestrator:
     """Routes one message to one reply."""
 
-    def __init__(self, router: IntentRouter, store: StateStore) -> None:
+    def __init__(
+        self,
+        router: IntentRouter,
+        store: StateStore,
+        resolver: DatetimeResolver,
+        tz: ZoneInfo,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
         self._router = router
         self._store = store
+        self._resolver = resolver
+        self._tz = tz
+        # Injectable so "tomorrow at 3pm" can be tested against a fixed reference
+        # instead of whatever day the suite happens to run on.
+        self._now = now or (lambda: datetime.now(tz))
 
     async def handle(self, chat_id: int, message: dict[str, Any]) -> Reply:
         # --- Step 0: message shape, no model call ------------------------------
@@ -151,7 +170,13 @@ class Orchestrator:
         elif intent == "faq":
             text_out = faq_reply(classification.faq_topic)
         elif intent == "booking":
-            text_out = booking_reply(state, classification.raw_datetime_text)
+            text_out = await booking_reply(
+                state,
+                classification.raw_datetime_text,
+                self._resolver,
+                self._now(),
+                self._tz,
+            )
         else:
             text_out = out_of_scope_reply()
 

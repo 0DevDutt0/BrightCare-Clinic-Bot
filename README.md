@@ -25,6 +25,51 @@ Backed by a live Google Calendar, confirmed by email, and gated behind a one-tim
 
 ---
 
+## See it working
+
+Not a mock-up. A live Telegram bot, a real Google Calendar event, and a real email —
+the same three artefacts every transcript in this README produces.
+
+<table>
+<tr>
+<td width="36%" valign="top">
+<img src="docs/1.png" alt="The BrightCare Clinic bot profile on Telegram, showing its username and description">
+</td>
+<td width="64%" valign="top">
+<img src="docs/2.png" alt="The bot's welcome message in Telegram, listing opening hours, location, walk-in policy and appointment length">
+</td>
+</tr>
+<tr>
+<td colspan="2" align="center">
+<sub><b>Live on Telegram</b> — every clinic fact in that welcome is served verbatim from <code>app/domain/business.py</code>. The model is never given the chance to invent one.</sub>
+</td>
+</tr>
+
+<tr>
+<td colspan="2" valign="top">
+<img src="docs/4.png" alt="The appointment as a Google Calendar event, created by the service account, with the patient email recorded in the description">
+</td>
+</tr>
+<tr>
+<td colspan="2" align="center">
+<sub><b>A real Google Calendar event</b> — written by the service account. The patient's address sits in the description rather than the attendee list, because a service account without Domain-Wide Delegation gets <code>403 forbiddenForServiceAccounts</code> and that fails the <i>entire</i> booking. <a href="#design-decisions-worth-defending">Why →</a></sub>
+</td>
+</tr>
+
+<tr>
+<td colspan="2" valign="top">
+<img src="docs/3.png" alt="The confirmation email as received in Gmail, with an appointment.ics attachment">
+</td>
+</tr>
+<tr>
+<td colspan="2" align="center">
+<sub><b>A real confirmation email</b> — delivered over Gmail SMTP, carrying an <code>.ics</code> attachment. Because the patient cannot be an attendee, that file is the <i>only</i> route the appointment has into their own calendar — which is why its UID is carried across a reschedule rather than regenerated.</sub>
+</td>
+</tr>
+</table>
+
+---
+
 ## Three things it does, one gate they share
 
 ```mermaid
@@ -67,6 +112,7 @@ has to answer a question booking never asks: *is the person typing entitled to d
 <details>
 <summary><b>Contents</b></summary>
 
+- [See it working](#see-it-working) — screenshots of the live bot, calendar and email
 - [What it actually does](#what-it-actually-does) — real transcripts
 - [Architecture](#architecture) · [How a message is routed](#how-a-message-is-routed)
 - [The booking conversation](#the-booking-conversation)

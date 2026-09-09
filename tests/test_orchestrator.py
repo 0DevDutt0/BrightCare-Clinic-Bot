@@ -161,7 +161,7 @@ async def test_cancelling_costs_one_model_call_and_never_reaches_layer_two(
 
     assert fake_llm.call_count == 1
     assert reply.intent == "cancel"
-    assert (await store.get(CHAT_ID)).stage == "awaiting_cancel_email"
+    assert (await store.get(CHAT_ID)).stage == "awaiting_change_email"
 
 
 async def test_asking_how_to_cancel_answers_instead_of_starting_the_flow(
@@ -188,7 +188,7 @@ async def test_starting_a_cancellation_abandons_a_booking_in_flight(
     await orchestrator.handle(CHAT_ID, {"text": "actually I need to cancel one"})
 
     state = await store.get(CHAT_ID)
-    assert state.stage == "awaiting_cancel_email"
+    assert state.stage == "awaiting_change_email"
     assert state.proposed_start is None
 
 
@@ -198,9 +198,9 @@ async def test_starting_a_cancellation_abandons_a_booking_in_flight(
         "awaiting_slot_confirmation",
         "awaiting_email",
         "awaiting_final_confirmation",
-        "awaiting_cancel_email",
+        "awaiting_change_email",
         "awaiting_cancel_confirmation",
-        "awaiting_cancel_code",
+        "awaiting_change_code",
     ],
 )
 async def test_active_flow_bypasses_the_classifier_entirely(

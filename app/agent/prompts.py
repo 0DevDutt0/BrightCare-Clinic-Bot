@@ -25,18 +25,28 @@ Choose exactly one intent:
                    openers with no question attached.
 - "faq"          - a question about the clinic itself: where it is, when it opens,
                    walk-ins, parking, how to cancel, how long a visit takes.
-- "booking"      - wants to make, move, or ask about the availability of an
-                   appointment. Includes messages that only name a time, such as
-                   "tomorrow at 3" or "is Friday morning free?".
-- "cancel"       - wants to call off an appointment they have already booked:
-                   "cancel my appointment", "I need to cancel Monday",
-                   "something came up, I can't make it".
+- "booking"      - wants a NEW appointment, or asks what is available. Includes
+                   messages that only name a time, such as "tomorrow at 3" or "is
+                   Friday morning free?". Moving one they already have is
+                   "reschedule", not this.
+- "cancel"       - explicitly wants to call off an appointment and not replace it:
+                   "cancel my appointment", "please cancel Monday".
+- "reschedule"   - explicitly wants to keep the appointment but at a different time:
+                   "can I move my appointment", "reschedule me to Friday",
+                   "can we push Monday to later in the week?".
+- "change_appointment"
+                 - something is up with an existing appointment, but they have NOT
+                   said whether they want it moved or called off: "I can't make
+                   Monday", "something came up about my appointment", "I have a
+                   problem with Tuesday". Use this whenever both are plausible - do
+                   NOT guess between "cancel" and "reschedule".
 - "out_of_scope" - anything else: weather, general medical advice, jokes, other
                    businesses, or any topic unrelated to this clinic.
 
 Return these fields:
 {
-  "intent": one of "greeting" | "faq" | "booking" | "cancel" | "out_of_scope",
+  "intent": one of "greeting" | "faq" | "booking" | "cancel" | "reschedule" |
+             "change_appointment" | "out_of_scope",
   "confidence": a number from 0.0 to 1.0 - how certain you are of the intent,
   "faq_topic": __TOPICS__ or null,
   "raw_datetime_text": string or null
@@ -45,9 +55,12 @@ Return these fields:
 Rules:
 - "faq_topic" is non-null only when intent is "faq". If the message is an FAQ but
   matches none of the listed topics, use null.
-- "cancel" is for calling off a real booking. A question ABOUT cancelling - "how do
-  I cancel?", "what's your cancellation policy?" - is "faq" with the "cancellation"
-  topic, not "cancel".
+- "cancel", "reschedule" and "change_appointment" are all about a booking that
+  already exists. A question ABOUT cancelling - "how do I cancel?", "what's your
+  cancellation policy?" - is "faq" with the "cancellation" topic instead.
+- Prefer "change_appointment" over guessing. Only use "cancel" or "reschedule" when
+  the message says which one it is; a message that merely reports a problem with an
+  appointment is "change_appointment", and the assistant will ask.
 - "raw_datetime_text" must be copied VERBATIM from the user's message - the exact
   substring they typed, such as "Monday at 2pm" or "tomorrow morning". Do NOT
   convert it to a date, a time, or any other format. Use null when no time is
@@ -78,8 +91,14 @@ message: "anything free tomorrow morning?"
 message: "I need to cancel my appointment"
 {"intent": "cancel", "confidence": 0.96, "faq_topic": null, "raw_datetime_text": null}
 
+message: "can I move my appointment to Friday?"
+{"intent": "reschedule", "confidence": 0.95, "faq_topic": null, "raw_datetime_text": "Friday"}
+
 message: "something came up, I can't make Monday"
-{"intent": "cancel", "confidence": 0.88, "faq_topic": null, "raw_datetime_text": "Monday"}
+{"intent": "change_appointment", "confidence": 0.9, "faq_topic": null, "raw_datetime_text": "Monday"}
+
+message: "I have a problem with my appointment"
+{"intent": "change_appointment", "confidence": 0.88, "faq_topic": null, "raw_datetime_text": null}
 
 message: "how do I cancel an appointment?"
 {"intent": "faq", "confidence": 0.93, "faq_topic": "cancellation", "raw_datetime_text": null}

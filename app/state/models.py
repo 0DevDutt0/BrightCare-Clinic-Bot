@@ -24,12 +24,24 @@ Stage = Literal[
     "awaiting_slot_confirmation",
     "awaiting_email",
     "awaiting_final_confirmation",
-    # Cancellation
-    "awaiting_cancel_email",
-    "awaiting_cancel_choice",
+    # Changing an appointment that already exists. The first four are shared by
+    # cancelling and rescheduling: both have to find the appointment and prove who is
+    # asking, and only what happens at the end differs.
+    "awaiting_change_email",
+    "awaiting_change_choice",
+    "awaiting_change_intent",
+    "awaiting_change_code",
+    # Cancelling
     "awaiting_cancel_confirmation",
-    "awaiting_cancel_code",
+    # Rescheduling
+    "awaiting_reschedule_time",
+    "awaiting_reschedule_confirmation",
 ]
+
+# Which of the two the user is doing. None means they have not said yet -- "I can't make
+# Monday" is a problem with an appointment, not an instruction about it -- and the flow
+# asks once it has the appointment in view.
+ChangeMode = Literal["cancel", "reschedule"]
 
 Role = Literal["user", "bot"]
 
@@ -64,8 +76,8 @@ class Turn(BaseModel):
     _check_at = field_validator("at")(_require_aware)
 
 
-class CancelCandidate(BaseModel):
-    """One appointment offered for cancellation, while the user picks between several.
+class ChangeCandidate(BaseModel):
+    """One appointment on offer, while the user picks between several.
 
     A flattened copy rather than the calendar's own
     :class:`~app.services.calendar_service.Appointment`: state sits below services and
@@ -76,6 +88,7 @@ class CancelCandidate(BaseModel):
     event_id: str
     start: datetime
     patient_name: str | None = None
+    ics_uid: str | None = None
 
     _check_start = field_validator("start")(_require_aware)
 
@@ -86,10 +99,10 @@ class ConversationState(BaseModel):
     ``stage`` drives routing: anything other than ``idle`` means the next message is a
     continuation of an active flow, not a fresh request to classify.
 
-    The ``cancel_*`` fields are the cancellation flow's working set. They are kept apart
-    from ``patient_email`` deliberately: that one is the address a *booking* was made
-    with and outlives the flow, while ``cancel_email`` is an unproven claim that the
-    one-time code is about to test, and it must not leak into a later booking.
+    The ``change_*`` fields are the working set for cancelling or rescheduling. They are
+    kept apart from ``patient_email`` deliberately: that one is the address a *booking*
+    was made with and outlives the flow, while ``change_email`` is an unproven claim that
+    the one-time code is about to test, and it must not leak into a later booking.
     """
 
     chat_id: int
@@ -100,21 +113,38 @@ class ConversationState(BaseModel):
     patient_email: str | None = None
     patient_name: str | None = None
 
-    # --- cancellation flow ---
-    cancel_email: str | None = None
-    cancel_event_id: str | None = None
-    cancel_start: datetime | None = None
-    cancel_name: str | None = None
-    cancel_candidates: list[CancelCandidate] = Field(default_factory=list)
-    cancel_otp: OtpChallenge | None = None
-    cancel_code_sends: int = 0
-    cancel_lookups: int = 0
+    # --- changing an existing appointment: cancel or reschedule ---
+    change_mode: ChangeMode | None = None
+    change_email: str | None = None
+    change_event_id: str | None = None
+    change_start: datetime | None = None
+    change_name: str | None = None
+    # Carried from the appointment being changed so the new one inherits it: it is the
+    # UID in the patient's own calendar, and a rescheduled appointment that arrives under
+    # a new UID is a second entry rather than a moved one.
+    change_ics_uid: str | None = None
+    change_ics_sequence: int = 0
+    # Set once the one-time code has been accepted. It survives a retry inside the same
+    # flow -- if the new slot is taken between verifying and booking, the user picks
+    # another time without proving themselves twice. It never survives reset_flow, so it
+    # only ever authorises the one appointment this flow already identified.
+    change_verified: bool = False
+    change_candidates: list[ChangeCandidate] = Field(default_factory=list)
+    change_otp: OtpChallenge | None = None
+    change_code_sends: int = 0
+    change_lookups: int = 0
+    # Where a reschedule is moving to, once a free slot has been found and agreed.
+    reschedule_start: datetime | None = None
 
     history: list[Turn] = Field(default_factory=list)
     updated_at: datetime = Field(default_factory=utc_now)
 
     _check_datetimes = field_validator(
-        "requested_start", "proposed_start", "cancel_start", "updated_at"
+        "requested_start",
+        "proposed_start",
+        "change_start",
+        "reschedule_start",
+        "updated_at",
     )(_require_aware)
 
     @property
@@ -138,7 +168,7 @@ class ConversationState(BaseModel):
         Used by the mid-flow escape hatch when a user changes the subject, and by the
         flows themselves on completion.
 
-        Every ``cancel_*`` field goes with it, the live one-time code included. A code
+        Every ``change_*`` field goes with it, the live one-time code included. A code
         that outlived its flow would still verify on the next one, against whatever
         appointment that flow had found -- which is exactly the thing the code exists to
         prevent.
@@ -147,12 +177,17 @@ class ConversationState(BaseModel):
         self.requested_start = None
         self.proposed_start = None
         self.raw_datetime_text = None
-        self.cancel_email = None
-        self.cancel_event_id = None
-        self.cancel_start = None
-        self.cancel_name = None
-        self.cancel_candidates = []
-        self.cancel_otp = None
-        self.cancel_code_sends = 0
-        self.cancel_lookups = 0
+        self.change_mode = None
+        self.change_email = None
+        self.change_event_id = None
+        self.change_start = None
+        self.change_name = None
+        self.change_ics_uid = None
+        self.change_ics_sequence = 0
+        self.change_verified = False
+        self.change_candidates = []
+        self.change_otp = None
+        self.change_code_sends = 0
+        self.change_lookups = 0
+        self.reschedule_start = None
         self.touch()

@@ -26,7 +26,7 @@ def _sentiment(text: str) -> bool | None:
 
 
 def _cancel_sentiment(text: str) -> bool | None:
-    """The cancellation flow's reading: "cancel" decides nothing on its own."""
+    """The cancel/reschedule flow's reading: "cancel" decides nothing on its own."""
     return read_yes_no(text, neutral=CANCEL_IS_NEUTRAL)
 
 

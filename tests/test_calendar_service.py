@@ -340,18 +340,42 @@ def event(
     return item
 
 
+LEGACY = event(
+    "legacy-1",
+    start="2026-09-09T08:30:00Z",
+    email=None,
+    name=None,
+    description="Booked via the assistant.\nPatient: Dev\n\nPatient email: dev@example.com",
+)
+
+
+def both_queries(tagged: list[dict], prose: list[dict]):
+    """Answer the property query and the free-text query, in whichever order they land.
+
+    They are issued concurrently, so respx's side_effect ordering is not something this
+    test may rely on -- the request itself says which is which.
+    """
+    def responder(request: httpx.Request) -> httpx.Response:
+        is_tagged = "privateExtendedProperty" in request.url.params
+        return httpx.Response(200, json={"items": tagged if is_tagged else prose})
+
+    return responder
+
+
 @respx.mock
-async def test_lookup_asks_for_an_exact_property_match_first(
+async def test_lookup_asks_for_an_exact_property_match(
     service: GoogleCalendarService,
 ) -> None:
     """Free text would do -- and would sometimes hand back a near miss."""
-    route = respx.get(EVENTS_URL).mock(
-        return_value=httpx.Response(200, json={"items": [event()]})
-    )
+    route = respx.get(EVENTS_URL).mock(side_effect=both_queries([event()], []))
 
     found = await service.find_upcoming_by_email("dev@example.com", *WINDOW)
 
-    query = route.calls[0].request.url.params
+    tagged_call = next(
+        call for call in route.calls
+        if "privateExtendedProperty" in call.request.url.params
+    )
+    query = tagged_call.request.url.params
     assert query["privateExtendedProperty"] == "patient_email=dev@example.com"
     assert query["singleEvents"] == "true"
     assert len(found) == 1
@@ -361,28 +385,48 @@ async def test_lookup_asks_for_an_exact_property_match_first(
 
 
 @respx.mock
-async def test_lookup_falls_back_to_free_text_for_older_events(
+async def test_lookup_also_reads_events_booked_before_the_property_existed(
     service: GoogleCalendarService,
 ) -> None:
-    """Events booked before the property existed carry the address only in prose."""
-    legacy = event(
-        email=None,
-        name=None,
-        description="Booked via the assistant.\nPatient: Dev\n\nPatient email: dev@example.com",
-    )
-    route = respx.get(EVENTS_URL).mock(
-        side_effect=[
-            httpx.Response(200, json={"items": []}),        # property query: nothing
-            httpx.Response(200, json={"items": [legacy]}),  # free text: found
-        ]
-    )
+    """Those carry the address in prose alone, and q does not search extended
+    properties -- so neither query is a superset of the other."""
+    route = respx.get(EVENTS_URL).mock(side_effect=both_queries([], [LEGACY]))
 
     found = await service.find_upcoming_by_email("dev@example.com", *WINDOW)
 
     assert route.call_count == 2
-    assert route.calls[1].request.url.params["q"] == "dev@example.com"
-    assert [item.event_id for item in found] == ["evt-1"]
+    prose_call = next(
+        call for call in route.calls if "q" in call.request.url.params
+    )
+    assert prose_call.request.url.params["q"] == "dev@example.com"
+    assert [item.event_id for item in found] == ["legacy-1"]
     assert found[0].patient_name == "Dev"    # read out of the description too
+
+
+@respx.mock
+async def test_a_legacy_appointment_is_not_hidden_behind_a_tagged_one(
+    service: GoogleCalendarService,
+) -> None:
+    """The reason both queries run every time. Stopping at the first non-empty result
+    would silently drop the older appointment, leaving no way to cancel it."""
+    respx.get(EVENTS_URL).mock(side_effect=both_queries([event("evt-1")], [LEGACY]))
+
+    found = await service.find_upcoming_by_email("dev@example.com", *WINDOW)
+
+    assert [item.event_id for item in found] == ["evt-1", "legacy-1"]
+
+
+@respx.mock
+async def test_an_event_both_queries_return_is_listed_once(
+    service: GoogleCalendarService,
+) -> None:
+    """New events match both -- the property exactly, and the description by text."""
+    tagged = event("evt-1", description="Patient email: dev@example.com")
+    respx.get(EVENTS_URL).mock(side_effect=both_queries([tagged], [tagged]))
+
+    found = await service.find_upcoming_by_email("dev@example.com", *WINDOW)
+
+    assert [item.event_id for item in found] == ["evt-1"]
 
 
 @respx.mock
@@ -392,19 +436,14 @@ async def test_free_text_near_misses_are_dropped(
     """Google's q tokenises. Offering somebody else's appointment for cancellation is
     the one mistake this function must not make, so every hit is re-checked exactly."""
     respx.get(EVENTS_URL).mock(
-        side_effect=[
-            httpx.Response(200, json={"items": []}),
-            httpx.Response(
-                200,
-                json={
-                    "items": [
-                        event("evt-1", email="dev@example.com.au"),
-                        event("evt-2", email="notdev@example.com"),
-                        event("evt-3", email="dev@example.com"),
-                    ]
-                },
-            ),
-        ]
+        side_effect=both_queries(
+            [],
+            [
+                event("evt-1", email="dev@example.com.au"),
+                event("evt-2", email="notdev@example.com"),
+                event("evt-3", email="dev@example.com"),
+            ],
+        )
     )
 
     found = await service.find_upcoming_by_email("dev@example.com", *WINDOW)
@@ -429,19 +468,14 @@ async def test_all_day_and_untagged_entries_are_not_appointments(
 ) -> None:
     """A clinic closure or a hand-written note is not something a patient may cancel."""
     respx.get(EVENTS_URL).mock(
-        side_effect=[
-            httpx.Response(200, json={"items": []}),
-            httpx.Response(
-                200,
-                json={
-                    "items": [
-                        {"id": "closure", "start": {"date": "2026-09-07"}},
-                        {"id": "note", "start": {"dateTime": "2026-09-07T08:30:00Z"}},
-                        event("evt-1"),
-                    ]
-                },
-            ),
-        ]
+        side_effect=both_queries(
+            [],
+            [
+                {"id": "closure", "start": {"date": "2026-09-07"}},
+                {"id": "note", "start": {"dateTime": "2026-09-07T08:30:00Z"}},
+                event("evt-1"),
+            ],
+        )
     )
 
     found = await service.find_upcoming_by_email("dev@example.com", *WINDOW)

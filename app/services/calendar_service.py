@@ -56,6 +56,18 @@ TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
 PATIENT_EMAIL_PROPERTY = "patient_email"
 PATIENT_NAME_PROPERTY = "patient_name"
 
+# The UID this appointment has in the *patient's* calendar, as opposed to the event id it
+# has in the clinic's. They are the same for a booking, and diverge the moment an
+# appointment is rescheduled: the clinic gets a new event, while the patient's copy has
+# to keep its UID or their client files the new time as a second entry beside the old.
+# Stored on the event because nothing else outlives a conversation.
+ICS_UID_PROPERTY = "ics_uid"
+
+# How many times that UID has been revised. A calendar client ignores an update whose
+# SEQUENCE has not increased, so without this the UID carry-forward works exactly once
+# and a second reschedule silently leaves the patient looking at the first new time.
+ICS_SEQUENCE_PROPERTY = "ics_sequence"
+
 # One page is plenty: this is one patient's upcoming appointments, not a calendar dump.
 MAX_SEARCH_RESULTS = 50
 
@@ -91,6 +103,10 @@ class Appointment:
     summary: str
     patient_email: str
     patient_name: str | None = None
+    # Falls back to the event id for anything booked before the property existed, which
+    # is exactly what those events' .ics files used as their UID anyway.
+    ics_uid: str | None = None
+    ics_sequence: int = 0
 
 
 class CalendarService(ABC):
@@ -123,8 +139,15 @@ class CalendarService(ABC):
         description: str = "",
         attendee_email: str | None = None,
         patient_name: str | None = None,
+        ics_uid: str | None = None,
+        ics_sequence: int = 0,
     ) -> str:
-        """Create the appointment; returns the created event id."""
+        """Create the appointment; returns the created event id.
+
+        ``ics_uid`` is the UID the patient's own calendar knows this appointment by.
+        Pass the previous one when rescheduling, so their client moves the entry instead
+        of adding a second. Omit it for a fresh booking and the event id is used.
+        """
 
     @abstractmethod
     async def find_upcoming_by_email(
@@ -333,17 +356,24 @@ class GoogleCalendarService(CalendarService):
     ) -> list[Appointment]:
         """Find this patient's upcoming appointments.
 
-        Two queries, tried in order, because the calendar holds two generations of event:
+        Two queries, because the calendar holds two generations of event and neither
+        query sees both:
 
         1. ``privateExtendedProperty`` -- an exact server-side match on the address
-           written by :meth:`create_event`. No false positives, one request.
-        2. ``q`` free text -- the fallback for events booked before that property
-           existed, which carry the address only in their prose description.
+           written by :meth:`create_event`. Cannot miss, and cannot false-positive.
+        2. ``q`` free text -- the only thing that sees events booked before that
+           property existed, which carry the address in their prose description alone.
+           ``q`` does not search extended properties, so it is not a superset of (1).
 
-        Whatever either query returns is then matched **exactly** on the address in
-        code. Google's free-text search tokenises, so ``q`` alone could hand back a
-        near-miss, and offering someone else's appointment for cancellation is the one
-        mistake this function must not make.
+        **Both run every time**, concurrently, and the results are merged on event id.
+        Running the second only when the first comes up empty would be one request
+        cheaper and would hide a legacy appointment behind a newer tagged one -- a
+        silent wrong answer, for as long as the booking horizon.
+
+        Whatever comes back is then matched **exactly** on the address in code. Google's
+        free-text search tokenises, so ``q`` alone could hand back a near-miss, and
+        offering someone else's appointment for cancellation is the one mistake this
+        function must not make.
         """
         _require_aware(window_start, "window_start")
         _require_aware(window_end, "window_end")
@@ -351,20 +381,23 @@ class GoogleCalendarService(CalendarService):
         if not wanted:
             return []
 
-        items = await self._search_events(
-            window_start,
-            window_end,
-            {"privateExtendedProperty": f"{PATIENT_EMAIL_PROPERTY}={wanted}"},
+        tagged, prose = await asyncio.gather(
+            self._search_events(
+                window_start,
+                window_end,
+                {"privateExtendedProperty": f"{PATIENT_EMAIL_PROPERTY}={wanted}"},
+            ),
+            self._search_events(window_start, window_end, {"q": wanted}),
         )
-        if not items:
-            items = await self._search_events(window_start, window_end, {"q": wanted})
 
-        found = [
-            appointment
-            for appointment in (self._to_appointment(item) for item in items)
-            if appointment is not None and appointment.patient_email.lower() == wanted
-        ]
-        found.sort(key=lambda appointment: appointment.start)
+        # Keyed by id, so an event both queries return is one appointment, not two.
+        by_id: dict[str, Appointment] = {}
+        for item in (*tagged, *prose):
+            appointment = self._to_appointment(item)
+            if appointment is not None and appointment.patient_email.lower() == wanted:
+                by_id[appointment.event_id] = appointment
+
+        found = sorted(by_id.values(), key=lambda appointment: appointment.start)
         logger.info("calendar.lookup_by_email", extra={"match_count": len(found)})
         return found
 
@@ -414,6 +447,8 @@ class GoogleCalendarService(CalendarService):
             patient_email=str(email).strip(),
             patient_name=private.get(PATIENT_NAME_PROPERTY)
             or _first_group(_DESCRIPTION_NAME, description),
+            ics_uid=private.get(ICS_UID_PROPERTY) or str(event_id),
+            ics_sequence=_as_int(private.get(ICS_SEQUENCE_PROPERTY)),
         )
 
     # ------------------------------------------------------------- write side
@@ -425,6 +460,8 @@ class GoogleCalendarService(CalendarService):
         description: str = "",
         attendee_email: str | None = None,
         patient_name: str | None = None,
+        ics_uid: str | None = None,
+        ics_sequence: int = 0,
     ) -> str:
         _require_aware(start, "start")
         body: dict[str, Any] = {
@@ -449,6 +486,10 @@ class GoogleCalendarService(CalendarService):
             private[PATIENT_EMAIL_PROPERTY] = attendee_email.strip().lower()
         if patient_name:
             private[PATIENT_NAME_PROPERTY] = patient_name
+        if ics_uid:
+            private[ICS_UID_PROPERTY] = ics_uid
+        if ics_sequence:
+            private[ICS_SEQUENCE_PROPERTY] = str(ics_sequence)
         if private:
             body["extendedProperties"] = {"private": private}
 
@@ -497,6 +538,14 @@ def _require_aware(moment: datetime, label: str) -> None:
 def _parse_rfc3339(value: str) -> datetime:
     """Parse a Google timestamp. Handles the trailing 'Z' fromisoformat once refused."""
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _as_int(value: Any) -> int:
+    """Extended properties come back as strings, and a hand-edited one may be nonsense."""
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _first_group(pattern: re.Pattern[str], text: str) -> str | None:

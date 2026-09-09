@@ -11,7 +11,7 @@ a sticker must cost zero model calls, and a mid-flow reply must skip the classif
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -91,9 +91,10 @@ class FakeCalendarService(CalendarService):
         # Slots that fall away between proposing and confirming, to exercise the race.
         self.taken_on_next_check: set[datetime] = set()
         self.calls: list[str] = []
-        # Existing appointments the cancellation flow can find, keyed by event id.
+        # Existing appointments the change flow can find, keyed by event id.
         self.appointments: dict[str, Appointment] = {}
         self.cancelled: list[str] = []
+        self._next_id = 0
 
     def _guard(self, call: str) -> None:
         self.calls.append(call)
@@ -133,6 +134,8 @@ class FakeCalendarService(CalendarService):
         description: str = "",
         attendee_email: str | None = None,
         patient_name: str | None = None,
+        ics_uid: str | None = None,
+        ics_sequence: int = 0,
     ) -> str:
         self._guard("create_event")
         self.busy.add(start)
@@ -143,18 +146,28 @@ class FakeCalendarService(CalendarService):
                 "description": description,
                 "attendee_email": attendee_email,
                 "patient_name": patient_name,
+                "ics_uid": ics_uid,
+                "ics_sequence": ics_sequence,
             }
         )
-        event_id = f"evt-{len(self.created)}"
+        # Skips ids a test seeded with add_appointment. Handing a created event the
+        # same id as an existing one made a reschedule cancel the event it had just
+        # made, and the fake reported success -- a fake that lies is worse than none.
+        self._next_id += 1
+        while f"evt-{self._next_id}" in self.appointments:
+            self._next_id += 1
+        event_id = f"evt-{self._next_id}"
         if attendee_email:
-            # So a booking made in one test is findable by the cancellation flow in the
-            # next line of the same test, exactly as it would be on a real calendar.
+            # So a booking made in one test is findable by the change flow in the next
+            # line of the same test, exactly as it would be on a real calendar.
             self.appointments[event_id] = Appointment(
                 event_id=event_id,
                 start=start,
                 summary=summary,
                 patient_email=attendee_email,
                 patient_name=patient_name,
+                ics_uid=ics_uid or event_id,
+                ics_sequence=ics_sequence,
             )
         return event_id
 
@@ -164,6 +177,8 @@ class FakeCalendarService(CalendarService):
         start: datetime,
         patient_email: str,
         patient_name: str | None = "Dev",
+        ics_uid: str | None = None,
+        ics_sequence: int = 0,
     ) -> Appointment:
         """Seed an appointment the way an earlier booking would have left one."""
         appointment = Appointment(
@@ -172,6 +187,8 @@ class FakeCalendarService(CalendarService):
             summary=f"Appointment - {patient_name or 'patient'}",
             patient_email=patient_email,
             patient_name=patient_name,
+            ics_uid=ics_uid or event_id,
+            ics_sequence=ics_sequence,
         )
         self.appointments[event_id] = appointment
         self.busy.add(start)
@@ -213,9 +230,11 @@ class FakeEmailService(EmailService):
         self.sent: list[dict[str, Any]] = []
         self.codes: list[dict[str, Any]] = []
         self.cancellations: list[dict[str, Any]] = []
+        self.reschedules: list[dict[str, Any]] = []
         # Set independently so a test can break only the code mail, or only the receipt.
         self.code_error: Exception | None = None
         self.cancellation_error: Exception | None = None
+        self.reschedule_error: Exception | None = None
 
     @property
     def last_code(self) -> str:
@@ -227,7 +246,7 @@ class FakeEmailService(EmailService):
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
-        event_id: str | None = None,
+        ics_uid: str | None = None,
     ) -> None:
         if self.error is not None:
             raise self.error
@@ -236,7 +255,7 @@ class FakeEmailService(EmailService):
                 "to_email": to_email,
                 "appointment_start": appointment_start,
                 "patient_name": patient_name,
-                "event_id": event_id,
+                "ics_uid": ics_uid,
             }
         )
 
@@ -263,7 +282,8 @@ class FakeEmailService(EmailService):
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
-        event_id: str | None = None,
+        ics_uid: str | None = None,
+        ics_sequence: int = 0,
     ) -> None:
         if self.cancellation_error is not None:
             raise self.cancellation_error
@@ -272,7 +292,30 @@ class FakeEmailService(EmailService):
                 "to_email": to_email,
                 "appointment_start": appointment_start,
                 "patient_name": patient_name,
-                "event_id": event_id,
+                "ics_uid": ics_uid,
+                "ics_sequence": ics_sequence,
+            }
+        )
+
+    async def send_reschedule_confirmation(
+        self,
+        to_email: str,
+        previous_start: datetime,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+        ics_uid: str | None = None,
+        ics_sequence: int = 1,
+    ) -> None:
+        if self.reschedule_error is not None:
+            raise self.reschedule_error
+        self.reschedules.append(
+            {
+                "to_email": to_email,
+                "previous_start": previous_start,
+                "appointment_start": appointment_start,
+                "patient_name": patient_name,
+                "ics_uid": ics_uid,
+                "ics_sequence": ics_sequence,
             }
         )
 
@@ -395,6 +438,43 @@ def orchestrator(
         email=email,
         tz=TZ,
         now=lambda: FIXED_NOW,
+    )
+
+
+class Clock:
+    """A hand-wound clock, so expiry can be tested without sleeping for ten minutes."""
+
+    def __init__(self, at: datetime) -> None:
+        self.at = at
+
+    def __call__(self) -> datetime:
+        return self.at
+
+    def advance(self, delta: timedelta) -> None:
+        self.at += delta
+
+
+@pytest.fixture
+def clock() -> Clock:
+    return Clock(FIXED_NOW)
+
+
+@pytest.fixture
+def subject(
+    fake_llm: FakeGroqClient,
+    store,
+    calendar: FakeCalendarService,
+    email: FakeEmailService,
+    clock: Clock,
+) -> Orchestrator:
+    return Orchestrator(
+        router=IntentRouter(fake_llm),
+        store=store,
+        resolver=DatetimeResolver(fake_llm),
+        calendar=calendar,
+        email=email,
+        tz=TZ,
+        now=clock,
     )
 
 

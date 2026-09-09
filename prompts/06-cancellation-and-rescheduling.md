@@ -1,4 +1,4 @@
-# Phase 6 — cancellation, verified by a one-time code
+# Phase 6 — cancelling and rescheduling, verified by a one-time code
 
 ## Instruction given
 
@@ -106,12 +106,22 @@ booked from. That is the whole design, and everything else follows from it.
     address probing worth attempting. Restarting the flow costs a classification, so the
     cap turns free probing back into paid.
 
-11. **Lookup is two queries, and the exact match is done in code.** An exact
-    `privateExtendedProperty` filter first; Google's free-text `q` as a fallback, because
-    events already on the real calendar from Phases 3–4 carry the address only in their
-    prose description. Whatever either returns is then matched exactly on the address,
-    because `q` tokenises and offering someone else's appointment for cancellation is the
-    one mistake this must not make.
+11. **Lookup runs two queries every time, and the exact match is done in code.** An exact
+    `privateExtendedProperty` filter, which cannot miss on tokenisation; and Google's
+    free-text `q`, which is the only thing that sees events already on the real calendar
+    from Phases 3–4, since those carry the address in their prose description alone and
+    `q` does not search extended properties. Neither is a superset of the other, so both
+    run — concurrently, merged on event id.
+
+    This started as "property first, `q` only if that came up empty", which is one
+    request cheaper and wrong: a patient with one legacy appointment and one tagged one
+    would have been shown only the tagged one, with no way to cancel the other, for as
+    long as the booking horizon. The live check below is what caught it — both shapes now
+    come back from one lookup.
+
+    Whatever either returns is then matched exactly on the address, because `q` tokenises
+    and offering someone else's appointment for cancellation is the one mistake this must
+    not make.
 
 12. **`create_event` now tags events** with a lowercased `patient_email` private
     property. Invisible to anyone reading the calendar, and an exact server-side filter —
@@ -171,7 +181,7 @@ appointment, and after a wrong code nothing further is revealed.
 
 ## Verified
 
-`327 → 462` tests. Twenty deliberate mutations were applied to the new code and the suite
+`327 → 509` tests. Twenty deliberate mutations were applied to the new code and the suite
 was run against each; all twenty turn it red:
 
 | mutation | |
@@ -223,9 +233,28 @@ BOT   Done - your appointment on Monday 7 September at 2:00 PM is cancelled and 
       slot is free again. I've emailed you a confirmation.               [0 calls]
 ```
 
-Not yet exercised against the live Google Calendar and Gmail SMTP; Phases 3 and 4 were,
-and this reuses their transport unchanged, but the two new endpoints — `events.list` with
-`privateExtendedProperty`, and `events.delete` — have only been driven against `respx`.
+### Against the live Google Calendar
+
+Run on 2026-09-09 against the real calendar. Two throwaway events were created 45 days
+out under a unique `@example.invalid` address — one tagged with `privateExtendedProperty`,
+one in the pre-Phase-6 description-only shape — then looked up, cancelled, and cleaned up.
+**16/16 checks passed:**
+
+- both generations of event come back from a single `find_upcoming_by_email`
+- starts arrive timezone-aware, in the clinic's zone
+- the name round-trips via the property, *and* parses out of legacy prose
+- a near-miss address (`not-<addr>`) matches nothing
+- `events.delete` removes both; the lookup then returns zero and `freeBusy` reports the
+  slot free again
+- a second delete raises `EventNotFound`, not a generic `CalendarError`
+
+That run is what turned up assumption 11's original ordering bug. It also confirms the
+service account has the write scope cancellation needs, which booking never exercised —
+it only ever created.
+
+**Still not exercised live:** Gmail SMTP for the two new messages. Phase 4 proved the
+transport with a real App Password and this reuses `_send` unchanged, so the risk is in
+how the code mail and the `METHOD:CANCEL` `.ics` *render*, not in whether they send.
 
 ## Out of scope
 
@@ -239,3 +268,165 @@ without access to the patient's inbox.
 **A rate limit across flows.** The caps here are per-flow. Restarting costs a
 classification, which is the only thing bounding repetition, and a real deployment
 wanting more would put it at the transport.
+
+---
+
+# Rescheduling, and knowing which one they meant
+
+## Instruction given
+
+> also add reshedule that is canceling an appointment and booking another appointment.
+> reshedule that is to change the appointment which is already there to new appointment
+> if there is any convinients. when the user didnot directky say cancel or any terms
+> related to that then u can ask the user that should u reshedule the appointment or
+> cancel the appointment
+
+## What was built
+
+Rescheduling, as specified: a cancellation with a booking attached. And the
+disambiguation the second half of that instruction asks for — when the message does not
+say which, the bot asks instead of guessing.
+
+`cancellation.py` became `changes.py`, because the two flows are the same conversation
+until the very end. Both find the appointment, both prove who is asking, and only the
+last step differs. Keeping them apart would have meant two copies of the one-time code.
+
+```
+idle
+  -> ask which address it was booked with       awaiting_change_email
+  -> (several matches) which one?               awaiting_change_choice
+  -> (mode unknown) move it or cancel it?       awaiting_change_intent
+     |
+     +-- cancel      -> read it back, confirm   awaiting_cancel_confirmation
+     |
+     +-- reschedule  -> what day and time?      awaiting_reschedule_time
+                     -> propose a free slot     awaiting_reschedule_confirmation
+  -> email a code, ask for it                   awaiting_change_code
+  -> verify, then do it, and return to          idle
+```
+
+Three Layer 1 intents open it: `cancel`, `reschedule`, and `change_appointment` for
+"I can't make Monday" — a message that reports a problem without instructing anything.
+
+## Assumptions made
+
+1. **Rescheduling books before it cancels.** Cancelling first and then failing to book
+   leaves a patient with no appointment and no warning. Booking first and then failing to
+   cancel leaves them with two, which is visible, recoverable, and said out loud:
+   *"I couldn't release the earlier one … please call the clinic so they can clear it."*
+   A test asserts the call order, and another asserts the half-done case is reported.
+
+2. **Rescheduling needs the same one-time code as cancelling.** It destroys an
+   appointment; that it also creates one does not make it less destructive. Every reason
+   cancelling needs proof applies unchanged.
+
+3. **Verification survives inside the flow, and only inside it.** If the new slot is
+   taken between entering the code and creating the event, the user picks another time
+   without proving themselves twice — same person, same flow, same appointment.
+   `reset_flow` clears the flag. Both halves are tested, and the second is the sharper
+   one: a flag that outlived the flow would let one code authorise cancelling every
+   appointment the chat could subsequently find, under any address.
+
+4. **The mode question waits until the appointment is in view.** Asking "reschedule or
+   cancel?" before knowing which appointment would cost a turn. Asked after, it merges
+   with the confirmation into one message: *"I found an appointment for Dev on Monday 7
+   September at 2:00 PM. Would you like to move it to another time, or cancel it
+   altogether?"*
+
+5. **`"cancel"` at that prompt is an answer, not an escape.** The escape hatch matches the
+   whole message, and `cancel` is in it — so without an exemption the bot would ask "move
+   it or cancel it?", hear "cancel", abandon the flow and reply *"nothing has been
+   cancelled"* to someone in the middle of cancelling. `_ESCAPE_EXEMPT` carves out that
+   one word at that one stage; `stop`, `quit` and the rest still work there.
+
+6. **A message naming both actions is not guessed at.** "don't cancel it, just move it"
+   returns None and re-asks. Picking one from a sentence that named the other is how a
+   booking the user meant to keep gets destroyed.
+
+7. **The reschedule flow is the one continuation that costs a model call.** Resolving
+   "Friday at 3pm" is Layer 2. Every other in-flow message in the app is free, and the
+   orchestrator logs and tests that, so the handler returns a `FlowResult` carrying
+   `used_llm` rather than letting the caller assume.
+
+8. **Booking's slot search was extracted, not copied.** `search_for_slot` resolves a
+   phrase, checks it against the clinic's rules and finds a free slot; both flows call
+   it, and a refused time is refused in the same words. A second copy of that sequence is
+   a second place for the opening hours to be got wrong.
+
+9. **Asking to move to the time you already have is answered as such.** The patient's own
+   appointment is on the calendar, so the naive answer is the slot *after* it —
+   technically true and baffling. Detected on the requested time, before availability.
+
+10. **Declining the offered slot returns to the time prompt, not out of the flow.** They
+    still want to move it; they just do not want that slot.
+
+11. **The `.ics` UID is carried forward, and the SEQUENCE is bumped.** This is what makes
+    the move a move in the *patient's* calendar rather than a second entry beside the
+    first. The clinic's event id necessarily changes — it is a new event — so the UID is
+    stored on the event as a private property, along with a sequence number. Without the
+    sequence the carry-forward works exactly once: a client ignores an update whose
+    SEQUENCE has not increased, so a second reschedule would silently leave the patient
+    looking at the first new time. Both are verified against the live calendar below.
+
+12. **One email for a move, not a cancellation plus a confirmation.** Two mails for one
+    action are noise, and worse, they race — arriving out of order they read as
+    "cancelled" last.
+
+13. **`event_id` was renamed to `ics_uid` throughout the email service.** It was only ever
+    used as the calendar UID, and after a reschedule the two are different things. A name
+    that is accurate until the first reschedule is a name that will mislead someone.
+
+## Verified
+
+`462 → 509` tests. Twelve further mutations were run against the reschedule code; all
+twelve turn the suite red, including:
+
+| mutation | |
+|---|---|
+| cancel the old appointment before booking the new one | caught |
+| skip the re-check on the new slot | caught |
+| give the moved appointment a fresh calendar UID | caught |
+| reuse the same SEQUENCE on every move | caught |
+| stay quiet when the old appointment could not be released | caught |
+| guess "cancel" when the user named both actions | caught |
+| let the escape hatch swallow "cancel" at the which-one prompt | caught |
+| report the reschedule continuation as free | caught |
+| make them verify again after a lost race | caught |
+| offer the slot after the one they already hold | caught |
+| **drop the verified flag out of `reset_flow`** | **initially MISSED** |
+
+That last row was a genuine hole, and the worst kind: the mutation leaves every test
+green while letting one code authorise cancelling any appointment the chat finds
+afterwards. Two tests now close it.
+
+### Against the live Google Calendar
+
+An appointment was booked, moved, and cleaned up on the real calendar. **14/14 checks
+passed**, including the parts no fake can prove:
+
+- a fresh booking's UID *is* its event id, and its sequence starts at 0
+- after the move exactly one appointment remains, at the new time, under a genuinely new
+  event id — but **carrying the original UID**, with the sequence bumped to 1
+- the earlier slot is free again
+- `ics_uid` and `ics_sequence` survive the round trip through Google's
+  `extendedProperties` (the sequence comes back as the string `"1"`, which is why it is
+  parsed defensively)
+
+### A fake that lied
+
+Worth recording. `FakeCalendarService` numbered created events `evt-{len(created)}`,
+which collided with ids a test had seeded — so a reschedule cancelled the event it had
+just created, and the fake reported success. Three tests caught it, but only because they
+asserted what was *left on the calendar* rather than what was returned. The fake now
+skips ids already in use.
+
+## Out of scope, still
+
+**Cancelling or moving on the clinic's behalf.** There is no staff path, and no way to
+change an appointment without access to the patient's inbox.
+
+**Rescheduling beyond the horizon.** The new time is bound by the same 90-day rule as a
+booking.
+
+**A rate limit across flows.** The caps here are per-flow. Restarting costs a
+classification, which is the only thing bounding repetition.

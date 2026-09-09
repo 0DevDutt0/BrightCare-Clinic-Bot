@@ -23,6 +23,7 @@ the request, not failing to answer it, and the router already knows how to read 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -73,15 +74,112 @@ BOOKING_CANCELLED = (
 
 # --------------------------------------------------------------------- helpers
 
-def _summary_for(state: ConversationState) -> str:
-    return f"Appointment - {state.patient_name or 'patient'}"
+def summary_for(patient_name: str | None) -> str:
+    """The event title. Shared with rescheduling, which recreates the same appointment."""
+    return f"Appointment - {patient_name or 'patient'}"
 
 
-def _description_for(state: ConversationState) -> str:
+def description_for(patient_name: str | None, note: str | None = None) -> str:
+    """The event body. ``note`` records how it came to be, e.g. that it was moved."""
     parts = [f"Booked via the {CLINIC_NAME} Telegram assistant."]
-    if state.patient_name:
-        parts.append(f"Patient: {state.patient_name}")
+    if patient_name:
+        parts.append(f"Patient: {patient_name}")
+    if note:
+        parts.append(note)
     return "\n".join(parts)
+
+
+# ------------------------------------------------------- turning a phrase into a slot
+
+@dataclass(frozen=True)
+class SlotSearch:
+    """What a time phrase turned into: a free slot, or the reason there isn't one.
+
+    Shared by booking and rescheduling. Both have to resolve a phrase, check it against
+    the clinic's rules and then ask Google whether the time is actually free, and both
+    have to explain a "no" in the same terms — a second copy of that sequence is a second
+    place for the opening hours to be got wrong.
+
+    ``refusal`` is a finished sentence, ready to send. ``requested`` is the grid-aligned
+    time the user asked for, which is not always the one offered.
+    """
+
+    slot: datetime | None = None
+    requested: datetime | None = None
+    refusal: str | None = None
+    moved: bool = False
+
+
+async def search_for_slot(
+    raw_datetime_text: str,
+    resolver: DatetimeResolver,
+    calendar: CalendarService,
+    now: datetime,
+    tz: ZoneInfo,
+) -> SlotSearch:
+    """Resolve a time phrase, validate it, and find the soonest free slot at or after it.
+
+    Costs one Layer 2 model call, and one calendar request only if the rules already
+    agree the time is legal — "is 2pm a bookable time?" needs no network.
+    """
+    try:
+        resolution = await resolver.resolve(raw_datetime_text, now)
+    except ResolutionError:
+        return SlotSearch(refusal=TROUBLE_RESOLVING)
+
+    if not resolution.has_day or not resolution.is_confident:
+        logger.info(
+            "booking.unresolved",
+            extra={
+                "has_day": resolution.has_day,
+                "confidence": round(resolution.confidence, 2),
+            },
+        )
+        return SlotSearch(
+            refusal=(
+                f"I'm not sure which date \"{raw_datetime_text}\" means. Could you give "
+                "me a specific day and time, like \"Tuesday at 3pm\"?"
+            )
+        )
+
+    decision = evaluate_request(resolution.day, resolution.clock, now, tz)
+    logger.info(
+        "booking.evaluated",
+        extra={"verdict": decision.verdict.value, "adjusted": decision.was_adjusted},
+    )
+    if not decision.ok or decision.slot is None:
+        return SlotSearch(
+            refusal=rejection_reply(
+                decision.verdict, resolution.day, decision.adjusted_from
+            )
+        )
+
+    try:
+        available = await calendar.find_nearest_available(decision.slot)
+    except CalendarError:
+        logger.exception("booking.availability_failed")
+        return SlotSearch(requested=decision.slot, refusal=CALENDAR_TROUBLE)
+
+    if available is None:
+        # Nothing left that day, and the rule forbids rolling to the next one.
+        day_text = format_day(decision.slot.date())
+        following = next_open_day(decision.slot.date())
+        suggestion = (
+            f" The next day we're open is {format_day(following)}." if following else ""
+        )
+        return SlotSearch(
+            requested=decision.slot,
+            refusal=(
+                f"I'm afraid we're fully booked for the rest of {day_text}.{suggestion} "
+                "Would another day work?"
+            ),
+        )
+
+    return SlotSearch(
+        slot=available,
+        requested=decision.slot,
+        moved=available != decision.slot or decision.was_adjusted,
+    )
 
 
 # ------------------------------------------------------------------ flow entry
@@ -101,61 +199,18 @@ async def start_booking(
     if not raw_datetime_text:
         return ASK_FOR_TIME
 
-    try:
-        resolution = await resolver.resolve(raw_datetime_text, now)
-    except ResolutionError:
-        return TROUBLE_RESOLVING
+    search = await search_for_slot(raw_datetime_text, resolver, calendar, now, tz)
+    if search.requested is not None:
+        state.requested_start = search.requested
+    if search.slot is None:
+        return search.refusal or TROUBLE_RESOLVING
 
-    if not resolution.has_day or not resolution.is_confident:
-        logger.info(
-            "booking.unresolved",
-            extra={
-                "has_day": resolution.has_day,
-                "confidence": round(resolution.confidence, 2),
-            },
-        )
-        return (
-            f"I'm not sure which date \"{raw_datetime_text}\" means. Could you give me "
-            "a specific day and time, like \"Tuesday at 3pm\"?"
-        )
-
-    decision = evaluate_request(resolution.day, resolution.clock, now, tz)
-    logger.info(
-        "booking.evaluated",
-        extra={"verdict": decision.verdict.value, "adjusted": decision.was_adjusted},
-    )
-    if not decision.ok or decision.slot is None:
-        return _rejection_reply(decision.verdict, resolution.day, decision.adjusted_from)
-
-    state.requested_start = decision.slot
-
-    # The rules say this time is legal. Only now is it worth asking Google whether
-    # it is actually free.
-    try:
-        available = await calendar.find_nearest_available(decision.slot)
-    except CalendarError:
-        logger.exception("booking.availability_failed")
-        return CALENDAR_TROUBLE
-
-    if available is None:
-        # Nothing left that day, and the rule forbids rolling to the next one.
-        day_text = format_day(decision.slot.date())
-        following = next_open_day(decision.slot.date())
-        suggestion = (
-            f" The next day we're open is {format_day(following)}." if following else ""
-        )
-        return (
-            f"I'm afraid we're fully booked for the rest of {day_text}.{suggestion} "
-            "Would another day work?"
-        )
-
-    state.proposed_start = available
+    state.proposed_start = search.slot
     state.stage = "awaiting_slot_confirmation"
     state.touch()
 
-    moved = available != decision.slot or decision.was_adjusted
-    when = format_slot(available)
-    if moved:
+    when = format_slot(search.slot)
+    if search.moved:
         return (
             f"The nearest free appointment is {when} - that's the first opening at or "
             f"after the time you asked for. It runs {SLOT_MINUTES} minutes. "
@@ -257,8 +312,8 @@ async def _handle_final_confirmation(
             )
         event_id = await calendar.create_event(
             start=slot,
-            summary=_summary_for(state),
-            description=_description_for(state),
+            summary=summary_for(state.patient_name),
+            description=description_for(state.patient_name),
             attendee_email=state.patient_email,
             patient_name=state.patient_name,
         )
@@ -275,9 +330,10 @@ async def _handle_final_confirmation(
                 to_email=state.patient_email,
                 appointment_start=slot,
                 patient_name=state.patient_name,
-                # The .ics UID is derived from this, so a later cancellation email can
-                # retract the very event this one added to the patient's calendar.
-                event_id=event_id,
+                # A fresh booking's UID is its event id. Rescheduling carries that UID
+                # forward, so the patient's calendar later moves the entry this mail
+                # created rather than filing a second one beside it.
+                ics_uid=event_id,
             )
             email_sent = True
         except EmailError:
@@ -302,10 +358,14 @@ async def _handle_final_confirmation(
 
 # ------------------------------------------------------------------- rejections
 
-def _rejection_reply(
+def rejection_reply(
     verdict: Verdict, day: date | None, asked_for: datetime | None
 ) -> str:
-    """Explain why a time cannot work, and give the user something to act on."""
+    """Explain why a time cannot work, and give the user something to act on.
+
+    Public because rescheduling refuses a time for exactly the same reasons, in exactly
+    the same words. Two copies of the opening hours is one too many.
+    """
     if verdict is Verdict.NEEDS_DAY:
         return ASK_FOR_TIME
 

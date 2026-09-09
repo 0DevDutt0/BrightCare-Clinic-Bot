@@ -16,7 +16,7 @@ from app.domain.business import FAQ_FACTS
 
 TOPIC_PROMPT = (
     "Happy to help. I can tell you about our location, opening hours, parking, "
-    "walk-in policy, how long an appointment takes, or how to cancel one. "
+    "walk-in policy, how long an appointment takes, or how to change one. "
     "Which would you like to know?"
 )
 

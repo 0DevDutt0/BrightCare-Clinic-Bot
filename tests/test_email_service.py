@@ -226,7 +226,7 @@ def cancelled_message(**overrides) -> EmailMessage:
         "from_email": "clinic@example.com",
         "from_name": CLINIC_NAME,
         "patient_name": "Dev",
-        "event_id": "evt-1",
+        "ics_uid": "evt-1",
         **overrides,
     }
     return build_cancellation_message(**kwargs)
@@ -254,7 +254,7 @@ def test_the_receipt_attaches_a_retraction() -> None:
 
 def test_the_retraction_matches_the_uid_of_the_booking() -> None:
     """Different UIDs would leave the patient with two calendar entries, one a ghost."""
-    booked = [p for p in message(event_id="evt-1").walk()
+    booked = [p for p in message(ics_uid="evt-1").walk()
               if p.get_filename() == "appointment.ics"][0].get_content()
     cancelled = [p for p in cancelled_message().walk()
                  if p.get_filename() == "cancelled.ics"][0].get_content()
@@ -409,7 +409,7 @@ async def test_the_disabled_service_refuses_rather_than_pretending() -> None:
 
 
 async def test_the_disabled_service_refuses_a_code_too() -> None:
-    """Which stops the cancellation flow dead, as it should: a code that cannot be sent
+    """Which stops the change flow dead, as it should: a code that cannot be sent
     cannot prove anything, and a prompt for it could never be satisfied."""
     with pytest.raises(EmailError, match="not configured"):
         await DisabledEmailService().send_cancellation_code(

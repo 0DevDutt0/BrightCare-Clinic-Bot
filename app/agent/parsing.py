@@ -30,8 +30,8 @@ FILLER_WORDS = frozenset(
 )
 KNOWN_WORDS = AFFIRMATIVE_WORDS | NEGATIVE_WORDS | FILLER_WORDS
 
-# What a cancellation flow passes as ``neutral``: inside one, "cancel" is the subject of
-# the conversation rather than a refusal, so it must decide nothing on its own.
+# What the cancel/reschedule flow passes as ``neutral``: inside it, "cancel" is the
+# subject of the conversation rather than a refusal, so it decides nothing on its own.
 CANCEL_IS_NEUTRAL = frozenset({"cancel"})
 
 # Longer than this and the message is making a request, not answering yes or no.

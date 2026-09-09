@@ -17,9 +17,9 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app.agent.handlers.cancellation import (
+from app.agent.handlers.changes import (
     ALREADY_GONE,
-    CANCEL_EMAIL_NOT_VALID,
+    EMAIL_NOT_VALID,
     CANCEL_TROUBLE_AFTER_CODE,
     CANCELLATION_DECLINED,
     CHOICE_UNCLEAR,
@@ -30,9 +30,9 @@ from app.agent.handlers.cancellation import (
     LOOKUP_TROUBLE,
     TOO_MANY_ATTEMPTS,
     TOO_MANY_CODES,
-    start_cancellation,
+    start_change,
 )
-from app.agent.orchestrator import CANCELLATION_ABANDONED, Orchestrator
+from app.agent.orchestrator import CHANGE_ABANDONED, Orchestrator
 from app.agent.resolver import DatetimeResolver
 from app.agent.router import IntentRouter
 from app.domain.otp import MAX_ATTEMPTS, MAX_SENDS, OTP_TTL
@@ -54,43 +54,6 @@ CHAT_ID = 555
 EMAIL = "dev@example.com"
 MON_2PM = datetime(2026, 9, 7, 14, 0, tzinfo=TZ)
 TUE_10AM = datetime(2026, 9, 8, 10, 0, tzinfo=TZ)
-
-
-class Clock:
-    """A hand-wound clock, so expiry can be tested without sleeping for ten minutes."""
-
-    def __init__(self, at: datetime) -> None:
-        self.at = at
-
-    def __call__(self) -> datetime:
-        return self.at
-
-    def advance(self, delta: timedelta) -> None:
-        self.at += delta
-
-
-@pytest.fixture
-def clock() -> Clock:
-    return Clock(FIXED_NOW)
-
-
-@pytest.fixture
-def subject(
-    fake_llm: FakeGroqClient,
-    store,
-    calendar: FakeCalendarService,
-    email: FakeEmailService,
-    clock: Clock,
-) -> Orchestrator:
-    return Orchestrator(
-        router=IntentRouter(fake_llm),
-        store=store,
-        resolver=DatetimeResolver(fake_llm),
-        calendar=calendar,
-        email=email,
-        tz=TZ,
-        now=clock,
-    )
 
 
 async def say(subject: Orchestrator, text: str) -> str:
@@ -128,7 +91,7 @@ async def test_a_whole_cancellation_from_request_to_deleted_event(
     calendar.add_appointment("evt-1", MON_2PM, EMAIL, "Dev")
 
     assert "email address" in await ask_to_cancel(subject, fake_llm)
-    assert (await store.get(CHAT_ID)).stage == "awaiting_cancel_email"
+    assert (await store.get(CHAT_ID)).stage == "awaiting_change_email"
 
     found = await say(subject, EMAIL)
     assert "Monday 7 September at 2:00 PM" in found
@@ -138,7 +101,7 @@ async def test_a_whole_cancellation_from_request_to_deleted_event(
     sent = await say(subject, "yes")
     assert "6-digit code" in sent
     assert EMAIL in sent
-    assert (await store.get(CHAT_ID)).stage == "awaiting_cancel_code"
+    assert (await store.get(CHAT_ID)).stage == "awaiting_change_code"
     assert len(email.codes) == 1
     assert calendar.cancelled == []          # nothing has happened yet
 
@@ -192,7 +155,7 @@ async def test_a_receipt_is_emailed_with_the_event_id(
     assert len(email.cancellations) == 1
     assert email.cancellations[0]["to_email"] == EMAIL
     assert email.cancellations[0]["appointment_start"] == MON_2PM
-    assert email.cancellations[0]["event_id"] == "evt-1"
+    assert email.cancellations[0]["ics_uid"] == "evt-1"
 
 
 async def test_the_code_email_names_the_appointment_it_authorises(
@@ -242,7 +205,7 @@ async def test_a_wrong_code_cancels_nothing_and_keeps_the_flow(
     assert "isn't right" in reply
     assert "2 attempts left" in reply
     assert calendar.cancelled == []
-    assert (await store.get(CHAT_ID)).stage == "awaiting_cancel_code"
+    assert (await store.get(CHAT_ID)).stage == "awaiting_change_code"
 
 
 async def test_the_right_code_still_works_after_a_wrong_one(
@@ -433,7 +396,7 @@ async def test_an_address_with_no_appointment_keeps_the_prompt_open(
 
     assert "couldn't find" in reply
     assert email.codes == []                 # no mail to an address with no booking
-    assert (await store.get(CHAT_ID)).stage == "awaiting_cancel_email"
+    assert (await store.get(CHAT_ID)).stage == "awaiting_change_email"
 
 
 async def test_a_second_address_is_looked_up_without_starting_over(
@@ -454,7 +417,7 @@ async def test_the_lookup_prompt_does_not_stay_open_forever(
 ) -> None:
     """An open prompt is a free calendar query per message, and free is what makes
     address probing worth attempting. Restarting costs a classification."""
-    from app.agent.handlers.cancellation import MAX_LOOKUPS, TOO_MANY_LOOKUPS
+    from app.agent.handlers.changes import MAX_LOOKUPS, TOO_MANY_LOOKUPS
 
     await ask_to_cancel(subject, fake_llm)
 
@@ -488,8 +451,8 @@ async def test_an_invalid_address_is_re_asked_not_rerouted(
 
     reply = await say(subject, bad)
 
-    assert reply == CANCEL_EMAIL_NOT_VALID
-    assert (await store.get(CHAT_ID)).stage == "awaiting_cancel_email"
+    assert reply == EMAIL_NOT_VALID
+    assert (await store.get(CHAT_ID)).stage == "awaiting_change_email"
 
 
 async def test_the_lookup_matches_the_address_exactly(
@@ -552,7 +515,7 @@ async def test_several_appointments_are_listed_and_numbered(
     assert "1. Monday 7 September at 2:00 PM" in reply
     assert "2. Tuesday 8 September at 10:00 AM" in reply
     assert email.codes == []                 # nothing is sent until one is chosen
-    assert (await store.get(CHAT_ID)).stage == "awaiting_cancel_choice"
+    assert (await store.get(CHAT_ID)).stage == "awaiting_change_choice"
 
 
 async def test_picking_a_number_cancels_that_one_and_only_that_one(
@@ -616,7 +579,7 @@ async def test_an_unusable_choice_re_asks(
     await say(subject, EMAIL)
 
     assert await say(subject, bad) == CHOICE_UNCLEAR
-    assert (await store.get(CHAT_ID)).stage == "awaiting_cancel_choice"
+    assert (await store.get(CHAT_ID)).stage == "awaiting_change_choice"
 
 
 # ---------------------------------------------------------------- backing out
@@ -684,10 +647,10 @@ async def test_yes_cancel_it_is_a_yes(
 @pytest.mark.parametrize(
     "stage",
     [
-        "awaiting_cancel_email",
-        "awaiting_cancel_choice",
+        "awaiting_change_email",
+        "awaiting_change_choice",
         "awaiting_cancel_confirmation",
-        "awaiting_cancel_code",
+        "awaiting_change_code",
     ],
 )
 async def test_backing_out_says_the_appointment_is_still_booked(
@@ -699,7 +662,7 @@ async def test_backing_out_says_the_appointment_is_still_booked(
 
     reply = await say(subject, "stop")
 
-    assert reply == CANCELLATION_ABANDONED
+    assert reply == CHANGE_ABANDONED
     assert "still booked" in reply
     assert fake_llm.call_count == 0
     assert (await store.get(CHAT_ID)).stage == "idle"
@@ -728,7 +691,7 @@ async def test_start_clears_a_cancellation_in_flight(
 
     state = await store.get(CHAT_ID)
     assert state.stage == "idle"
-    assert state.cancel_otp is None
+    assert state.change_otp is None
     assert calendar.cancelled == []
 
 
@@ -786,7 +749,7 @@ async def test_a_calendar_failure_after_a_good_code_keeps_the_code_usable(
 
     reply = await say(subject, code)
     assert reply == CANCEL_TROUBLE_AFTER_CODE
-    assert (await store.get(CHAT_ID)).stage == "awaiting_cancel_code"
+    assert (await store.get(CHAT_ID)).stage == "awaiting_change_code"
 
     calendar.error = None
     assert "cancelled" in await say(subject, code)
@@ -856,7 +819,7 @@ async def test_a_cancellation_does_not_inherit_the_booking_address(
     reply = await ask_to_cancel(subject, fake_llm)
 
     assert "email address" in reply
-    assert (await store.get(CHAT_ID)).stage == "awaiting_cancel_email"
+    assert (await store.get(CHAT_ID)).stage == "awaiting_change_email"
     assert email.codes == []
 
 
@@ -872,9 +835,9 @@ def test_starting_a_cancellation_clears_whatever_was_in_flight() -> None:
         raw_datetime_text="Monday at 2pm",
     )
 
-    start_cancellation(state)
+    start_change(state, "cancel")
 
-    assert state.stage == "awaiting_cancel_email"
+    assert state.stage == "awaiting_change_email"
     assert state.proposed_start is None
     assert state.raw_datetime_text is None
 
@@ -890,5 +853,47 @@ async def test_the_cancel_address_never_leaks_into_a_later_booking(
     await say(subject, "stop")
 
     state = await store.get(CHAT_ID)
-    assert state.cancel_email is None
+    assert state.change_email is None
     assert state.patient_email is None
+
+
+async def test_verification_does_not_carry_into_the_next_change(
+    subject: Orchestrator,
+    fake_llm: FakeGroqClient,
+    calendar: FakeCalendarService,
+    email: FakeEmailService,
+    store,
+) -> None:
+    """The sharpest edge on the verified flag. It exists so a lost race inside one flow
+    does not cost a second code -- if it outlived the flow, one code would authorise
+    cancelling every appointment the chat could find afterwards, under any address.
+    """
+    calendar.add_appointment("evt-1", MON_2PM, EMAIL, "Dev")
+    calendar.add_appointment("evt-2", TUE_10AM, "someone@else.example", "Someone")
+    await ask_to_cancel(subject, fake_llm)
+    await say(subject, EMAIL)
+    await say(subject, "yes")
+    await say(subject, email.last_code)
+    assert calendar.cancelled == ["evt-1"]
+    codes_so_far = len(email.codes)
+
+    # A second appointment, a different address, the same chat.
+    await ask_to_cancel(subject, fake_llm)
+    await say(subject, "someone@else.example")
+    reply = await say(subject, "yes")
+
+    assert "6-digit code" in reply
+    assert len(email.codes) == codes_so_far + 1
+    assert calendar.cancelled == ["evt-1"]         # not yet -- it needs the new code
+    assert (await store.get(CHAT_ID)).stage == "awaiting_change_code"
+
+
+def test_reset_clears_the_verified_flag() -> None:
+    """Directly, because the flow above can only reach it one way and this invariant
+    has to hold however the flow is rearranged later."""
+    state = ConversationState(chat_id=CHAT_ID, stage="awaiting_change_code")
+    state.change_verified = True
+
+    state.reset_flow()
+
+    assert state.change_verified is False

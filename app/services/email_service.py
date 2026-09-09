@@ -69,7 +69,7 @@ class EmailService(ABC):
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
-        event_id: str | None = None,
+        ics_uid: str | None = None,
     ) -> None:
         """Email a confirmation for an appointment at ``appointment_start`` (aware)."""
 
@@ -89,14 +89,33 @@ class EmailService(ABC):
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
-        event_id: str | None = None,
+        ics_uid: str | None = None,
+        ics_sequence: int = 0,
     ) -> None:
         """Email a receipt for an appointment that has just been cancelled."""
+
+    @abstractmethod
+    async def send_reschedule_confirmation(
+        self,
+        to_email: str,
+        previous_start: datetime,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+        ics_uid: str | None = None,
+        ics_sequence: int = 1,
+    ) -> None:
+        """Email a receipt for an appointment that has just moved."""
 
 
 # ------------------------------------------------------------------ construction
 
-def build_ics(start: datetime, uid: str | None = None, *, cancelled: bool = False) -> str:
+def build_ics(
+    start: datetime,
+    uid: str | None = None,
+    *,
+    cancelled: bool = False,
+    sequence: int | None = None,
+) -> str:
     """A minimal VEVENT the patient's mail client can add to their own calendar.
 
     Times are emitted in UTC with a trailing Z, which every client understands and
@@ -125,8 +144,10 @@ def build_ics(start: datetime, uid: str | None = None, *, cancelled: bool = Fals
         "METHOD:CANCEL" if cancelled else "METHOD:PUBLISH",
         "BEGIN:VEVENT",
         f"UID:{uid or uuid.uuid4()}@brightcare.invalid",
-        # A retraction must outrank the original, or a client keeps the one it has.
-        f"SEQUENCE:{1 if cancelled else 0}",
+        # A revision must outrank the copy the client already holds, or it is ignored.
+        # Defaults to 1 for a retraction and 0 for an original; a reschedule passes the
+        # next number in the appointment's own run, since it may not be the first.
+        f"SEQUENCE:{(1 if cancelled else 0) if sequence is None else max(sequence, 0)}",
         f"DTSTAMP:{stamp(datetime.now(timezone.utc))}",
         f"DTSTART:{stamp(start)}",
         f"DTEND:{stamp(start + SLOT_DURATION)}",
@@ -165,7 +186,7 @@ def build_confirmation_message(
     from_email: str,
     from_name: str,
     patient_name: str | None = None,
-    event_id: str | None = None,
+    ics_uid: str | None = None,
 ) -> EmailMessage:
     """Assemble the confirmation. Pure: no I/O, no configuration lookup."""
     _require_aware_start(appointment_start)
@@ -205,7 +226,7 @@ def build_confirmation_message(
     )
 
     message.add_attachment(
-        build_ics(appointment_start, event_id).encode("utf-8"),
+        build_ics(appointment_start, ics_uid).encode("utf-8"),
         maintype="text",
         subtype="calendar",
         filename="appointment.ics",
@@ -287,7 +308,8 @@ def build_cancellation_message(
     from_email: str,
     from_name: str,
     patient_name: str | None = None,
-    event_id: str | None = None,
+    ics_uid: str | None = None,
+    ics_sequence: int = 0,
 ) -> EmailMessage:
     """Assemble the cancellation receipt. Pure: no I/O, no configuration lookup."""
     _require_aware_start(appointment_start)
@@ -329,10 +351,82 @@ def build_cancellation_message(
     )
 
     message.add_attachment(
-        build_ics(appointment_start, event_id, cancelled=True).encode("utf-8"),
+        build_ics(appointment_start, ics_uid, cancelled=True, sequence=ics_sequence).encode("utf-8"),
         maintype="text",
         subtype="calendar",
         filename="cancelled.ics",
+    )
+    return message
+
+
+def build_reschedule_message(
+    to_email: str,
+    previous_start: datetime,
+    appointment_start: datetime,
+    from_email: str,
+    from_name: str,
+    patient_name: str | None = None,
+    ics_uid: str | None = None,
+    ics_sequence: int = 1,
+) -> EmailMessage:
+    """Assemble the "your appointment has moved" receipt. Pure: no I/O.
+
+    One message, not a cancellation followed by a confirmation. Two mails for one action
+    is noise, and worse, they race: arriving out of order in an inbox they read as
+    "cancelled" last, which is the opposite of what happened.
+
+    The attachment carries the appointment's *existing* UID with a higher SEQUENCE and
+    the new time, which is what iCalendar rescheduling actually is -- a client that
+    honours it moves the entry. A fresh UID would leave the old time sitting beside the
+    new one, which is the failure this mechanism exists to avoid.
+    """
+    _require_aware_start(previous_start)
+    _require_aware_start(appointment_start)
+
+    was, now = format_slot(previous_start), format_slot(appointment_start)
+    greeting = f"Hello {patient_name}," if patient_name else "Hello,"
+
+    message = _envelope(
+        f"Moved - your appointment at {CLINIC_NAME} is now {now}",
+        to_email,
+        from_email,
+        from_name,
+    )
+
+    message.set_content(
+        f"{greeting}\n\n"
+        f"Your appointment at {CLINIC_NAME} has been moved.\n\n"
+        f"  Was:   {was}\n"
+        f"  Now:   {now}\n"
+        f"  Where: {CLINIC_ADDRESS}\n"
+        f"  Length: {SLOT_MINUTES} minutes\n\n"
+        "The earlier time has been released. Nothing further is needed.\n\n"
+        f"{CLINIC_NAME}\n"
+    )
+
+    message.add_alternative(
+        f"""\
+<html><body style="font-family:system-ui,sans-serif;color:#1a1a1a">
+  <p>{greeting}</p>
+  <p>Your appointment at <strong>{CLINIC_NAME}</strong> has been moved.</p>
+  <table cellpadding="6" style="border-collapse:collapse">
+    <tr><td><strong>Was</strong></td><td><s>{was}</s></td></tr>
+    <tr><td><strong>Now</strong></td><td><strong>{now}</strong></td></tr>
+    <tr><td><strong>Where</strong></td><td>{CLINIC_ADDRESS}</td></tr>
+    <tr><td><strong>Length</strong></td><td>{SLOT_MINUTES} minutes</td></tr>
+  </table>
+  <p>The earlier time has been released. Nothing further is needed.</p>
+  <p>{CLINIC_NAME}</p>
+</body></html>
+""",
+        subtype="html",
+    )
+
+    message.add_attachment(
+        build_ics(appointment_start, ics_uid, sequence=ics_sequence).encode("utf-8"),
+        maintype="text",
+        subtype="calendar",
+        filename="appointment.ics",
     )
     return message
 
@@ -365,7 +459,7 @@ class SmtpEmailService(EmailService):
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
-        event_id: str | None = None,
+        ics_uid: str | None = None,
     ) -> None:
         await self._send(
             build_confirmation_message(
@@ -374,7 +468,7 @@ class SmtpEmailService(EmailService):
                 from_email=self._from_email,
                 from_name=self._from_name,
                 patient_name=patient_name,
-                event_id=event_id,
+                ics_uid=ics_uid,
             ),
             to_email,
             kind="confirmation",
@@ -405,7 +499,8 @@ class SmtpEmailService(EmailService):
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
-        event_id: str | None = None,
+        ics_uid: str | None = None,
+        ics_sequence: int = 0,
     ) -> None:
         await self._send(
             build_cancellation_message(
@@ -414,10 +509,35 @@ class SmtpEmailService(EmailService):
                 from_email=self._from_email,
                 from_name=self._from_name,
                 patient_name=patient_name,
-                event_id=event_id,
+                ics_uid=ics_uid,
+                ics_sequence=ics_sequence,
             ),
             to_email,
             kind="cancellation",
+        )
+
+    async def send_reschedule_confirmation(
+        self,
+        to_email: str,
+        previous_start: datetime,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+        ics_uid: str | None = None,
+        ics_sequence: int = 1,
+    ) -> None:
+        await self._send(
+            build_reschedule_message(
+                to_email=to_email,
+                previous_start=previous_start,
+                appointment_start=appointment_start,
+                from_email=self._from_email,
+                from_name=self._from_name,
+                patient_name=patient_name,
+                ics_uid=ics_uid,
+                ics_sequence=ics_sequence,
+            ),
+            to_email,
+            kind="reschedule",
         )
 
     async def _send(self, message: EmailMessage, to_email: str, *, kind: str) -> None:
@@ -465,8 +585,9 @@ class DisabledEmailService(EmailService):
     confirmation would tell the patient so, and nothing would arrive.
 
     For booking that is a degraded but working service -- the appointment is real, and
-    the reply says no email is coming. For cancellation it is a closed door, since the
-    code has nowhere to go; the flow stops and says so rather than pretending to verify.
+    the reply says no email is coming. For cancelling and rescheduling it is a closed
+    door, since the one-time code has nowhere to go; those flows stop and say so rather
+    than pretending to verify.
     """
 
     _MESSAGE = "SMTP is not configured; set the SMTP_* environment variables"
@@ -476,7 +597,7 @@ class DisabledEmailService(EmailService):
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
-        event_id: str | None = None,
+        ics_uid: str | None = None,
     ) -> None:
         raise EmailError(self._MESSAGE)
 
@@ -494,6 +615,18 @@ class DisabledEmailService(EmailService):
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
-        event_id: str | None = None,
+        ics_uid: str | None = None,
+        ics_sequence: int = 0,
+    ) -> None:
+        raise EmailError(self._MESSAGE)
+
+    async def send_reschedule_confirmation(
+        self,
+        to_email: str,
+        previous_start: datetime,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+        ics_uid: str | None = None,
+        ics_sequence: int = 1,
     ) -> None:
         raise EmailError(self._MESSAGE)

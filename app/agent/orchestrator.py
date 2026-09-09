@@ -31,7 +31,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from app.agent.handlers.booking import continue_booking, start_booking
-from app.agent.handlers.cancellation import continue_cancellation, start_cancellation
+from app.agent.handlers.changes import continue_change, start_change
 from app.agent.handlers.faq import faq_reply
 from app.agent.handlers.greeting import greeting_reply
 from app.agent.handlers.out_of_scope import out_of_scope_reply
@@ -53,28 +53,47 @@ TROUBLE_MESSAGE = (
 CLARIFY_MESSAGE = (
     "I'm not sure I understood. You can ask about the clinic - location, hours, "
     "parking, or walk-ins - tell me a day and time to book an appointment, or say "
-    "you'd like to cancel one."
+    "you'd like to move or cancel one."
 )
 FLOW_CLEARED = f"No problem, I've cleared that. {CAPABILITIES}"
-# Backing out of a *cancellation* needs its own wording. "I've cleared that" is fine
-# when the abandoned flow was a booking, and dangerously readable as "cleared your
-# appointment" when it was not -- the one sentence a patient must not misread.
-CANCELLATION_ABANDONED = (
-    "Alright, I've stopped there - nothing has been cancelled and your appointment is "
-    f"still booked. {CAPABILITIES}"
+# Backing out of a *change* needs its own wording. "I've cleared that" is fine when the
+# abandoned flow was a booking, and dangerously readable as "cleared your appointment"
+# when it was not -- the one sentence a patient must not misread.
+CHANGE_ABANDONED = (
+    "Alright, I've stopped there - nothing has changed and your appointment is still "
+    f"booked as it was. {CAPABILITIES}"
 )
 
 COMMANDS = frozenset({"/start", "/help"})
 
-# Stages owned by the cancellation flow. Everything else non-idle belongs to booking.
-CANCELLATION_STAGES = frozenset(
+# Stages owned by the change flow -- cancelling or rescheduling. Everything else
+# non-idle belongs to booking.
+CHANGE_STAGES = frozenset(
     {
-        "awaiting_cancel_email",
-        "awaiting_cancel_choice",
+        "awaiting_change_email",
+        "awaiting_change_choice",
+        "awaiting_change_intent",
+        "awaiting_change_code",
         "awaiting_cancel_confirmation",
-        "awaiting_cancel_code",
+        "awaiting_reschedule_time",
+        "awaiting_reschedule_confirmation",
     }
 )
+
+# The one stage where "cancel" is an answer rather than a way out. The bot has just
+# asked "move it, or cancel it?", so treating the reply as an escape would abandon the
+# flow and tell the user nothing was cancelled -- while they were trying to cancel.
+_ESCAPE_EXEMPT = {"awaiting_change_intent": frozenset({"cancel"})}
+
+# Intents that open the change flow, and what each one already tells us. None means the
+# user has said something is up with an appointment without saying what they want done:
+# "I can't make Monday" is a problem, not an instruction. Guessing there either destroys
+# a booking they meant to keep or leaves one they meant to drop, so the flow asks.
+CHANGE_INTENTS: dict[str, str | None] = {
+    "cancel": "cancel",
+    "reschedule": "reschedule",
+    "change_appointment": None,
+}
 
 # Deterministic mid-flow escape hatch. Keyword matching keeps it free: recognising a
 # topic change with the model would cost a classification on every in-flow message,
@@ -171,29 +190,44 @@ class Orchestrator:
         # --- Step 1: active flow owns the message ------------------------------
         if state.is_active:
             stage = state.stage
-            cancelling = stage in CANCELLATION_STAGES
+            changing = stage in CHANGE_STAGES
 
-            if stripped.lower() in ESCAPE_PHRASES:
+            # A stage may claim a word the escape hatch would otherwise swallow.
+            escapes = ESCAPE_PHRASES - _ESCAPE_EXEMPT.get(stage, frozenset())
+            if stripped.lower() in escapes:
                 state.reset_flow()
                 logger.info(
                     "orchestrator.flow_cleared", extra={"chat_id": chat_id, "stage": stage}
                 )
-                cleared = CANCELLATION_ABANDONED if cancelling else FLOW_CLEARED
+                cleared = CHANGE_ABANDONED if changing else FLOW_CLEARED
                 return await self._finish(state, Reply(cleared, "flow_cleared"))
 
-            if cancelling:
-                # Cancellation always answers: it has no reclassify path, because
-                # nothing at one of its prompts reinterprets as a different request,
-                # and dropping the flow silently while confirming a destructive action
-                # is the wrong instinct.
+            if changing:
+                # Changing always answers: it has no reclassify path, because nothing at
+                # one of its prompts reinterprets as a different request, and dropping
+                # the flow silently while confirming a destructive action is the wrong
+                # instinct. It is also the one continuation that can cost a model call,
+                # so it reports that itself rather than being assumed free.
+                result = await continue_change(
+                    state,
+                    stripped,
+                    self._resolver,
+                    self._calendar,
+                    self._email,
+                    self._now(),
+                    self._tz,
+                )
+                logger.info(
+                    "orchestrator.continuation",
+                    extra={
+                        "chat_id": chat_id,
+                        "stage": stage,
+                        "used_llm": result.used_llm,
+                    },
+                )
                 return await self._finish(
                     state,
-                    Reply(
-                        await continue_cancellation(
-                            state, stripped, self._calendar, self._email, self._now()
-                        ),
-                        f"continuation.{stage}",
-                    ),
+                    Reply(result.text, f"continuation.{stage}", used_llm=result.used_llm),
                 )
 
             flow_reply = await continue_booking(
@@ -249,11 +283,13 @@ class Orchestrator:
                 self._now(),
                 self._tz,
             )
-        elif intent == "cancel":
-            # No Layer 2 call: which appointment is settled by the calendar lookup and,
-            # where several match, by the user picking a number -- both cheaper and more
-            # certain than resolving "Monday" and hoping it names only one of them.
-            text_out = start_cancellation(state)
+        elif intent in CHANGE_INTENTS:
+            # No Layer 2 call here: which appointment is settled by the calendar lookup
+            # and, where several match, by the user picking a number -- both cheaper and
+            # more certain than resolving "Monday" and hoping it names only one of them.
+            # A reschedule spends one later, on the new time, once there is an
+            # appointment to move.
+            text_out = start_change(state, CHANGE_INTENTS[intent])
         else:
             text_out = out_of_scope_reply()
 

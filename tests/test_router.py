@@ -52,6 +52,26 @@ async def test_transport_failure_becomes_a_routing_error() -> None:
         await IntentRouter(llm).classify("hello")
 
 
+async def test_cancel_is_a_first_class_intent() -> None:
+    llm = FakeGroqClient()
+    llm.queue(classification("cancel", 0.94))
+
+    result = await IntentRouter(llm).classify("I need to cancel my appointment")
+
+    assert result.intent == "cancel"
+    assert result.is_confident
+
+
+def test_the_prompt_separates_cancelling_from_asking_how_to_cancel() -> None:
+    """One starts a destructive flow; the other is a question with an answer. Without
+    the distinction spelled out, "how do I cancel?" walks the user into the flow."""
+    from app.agent.prompts import INTENT_CLASSIFIER_PROMPT
+
+    assert '"cancel"' in INTENT_CLASSIFIER_PROMPT
+    assert "how do I cancel an appointment?" in INTENT_CLASSIFIER_PROMPT
+    assert '"faq_topic": "cancellation"' in INTENT_CLASSIFIER_PROMPT
+
+
 async def test_unknown_faq_topic_is_dropped_not_fatal() -> None:
     """A bad topic still came with a good intent; keep the intent."""
     llm = FakeGroqClient()

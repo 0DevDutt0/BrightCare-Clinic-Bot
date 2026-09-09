@@ -14,10 +14,13 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.domain.business import CLINIC_ADDRESS, CLINIC_NAME
+from app.domain.otp import MAX_ATTEMPTS
 from app.services.email_service import (
     DisabledEmailService,
     EmailError,
     SmtpEmailService,
+    build_cancellation_code_message,
+    build_cancellation_message,
     build_confirmation_message,
     build_ics,
 )
@@ -138,9 +141,133 @@ def test_each_ics_gets_a_unique_uid() -> None:
     assert build_ics(MON_2PM) != build_ics(MON_2PM)
 
 
+def test_the_uid_is_derived_from_the_event_id_when_one_is_given() -> None:
+    """Stable across the booking and the cancellation, which is what lets the second
+    file retract the first rather than adding a duplicate."""
+    assert "UID:evt-1@" in build_ics(MON_2PM, "evt-1")
+    assert "UID:evt-1@" in build_ics(MON_2PM, "evt-1", cancelled=True)
+
+
 def test_a_naive_ics_time_is_refused() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         build_ics(datetime(2026, 9, 7, 14, 0))
+
+
+def test_a_cancelled_ics_retracts_rather_than_adds() -> None:
+    ics = build_ics(MON_2PM, "evt-1", cancelled=True)
+
+    assert "METHOD:CANCEL" in ics
+    assert "STATUS:CANCELLED" in ics
+    # Without a higher SEQUENCE a client keeps the copy it already has.
+    assert "SEQUENCE:1" in ics
+    assert "SEQUENCE:0" in build_ics(MON_2PM, "evt-1")
+
+
+# -------------------------------------------------------------- code email
+
+def code_message(**overrides) -> EmailMessage:
+    kwargs = {
+        "to_email": "patient@example.com",
+        "code": "123456",
+        "appointment_start": MON_2PM,
+        "from_email": "clinic@example.com",
+        "from_name": CLINIC_NAME,
+        "patient_name": "Dev",
+        **overrides,
+    }
+    return build_cancellation_code_message(**kwargs)
+
+
+def test_the_code_is_in_the_subject_where_a_notification_shows_it() -> None:
+    assert "123456" in code_message()["Subject"]
+
+
+def test_the_code_email_names_the_appointment_at_stake() -> None:
+    """Anyone can start this flow by typing somebody else's address, so the mail has to
+    say what is about to be cancelled."""
+    text = body_of(code_message(), "plain")
+
+    assert "123456" in text
+    assert "Monday 7 September at 2:00 PM" in text
+    assert CLINIC_ADDRESS in text
+
+
+def test_the_code_email_tells_the_owner_how_to_do_nothing() -> None:
+    """The recourse for a real owner who did not ask for this: ignore it."""
+    for subtype in ("plain", "html"):
+        body = body_of(code_message(), subtype)
+        assert "ignore this email" in body
+        assert "stands" in body
+
+
+def test_the_code_email_states_its_limits() -> None:
+    text = body_of(code_message(), "plain")
+
+    assert "10 minutes" in text
+    assert str(MAX_ATTEMPTS) in text
+
+
+def test_the_code_email_carries_no_calendar_file() -> None:
+    """It is a credential, not a record of an appointment."""
+    assert not [part for part in code_message().walk() if part.get_filename()]
+
+
+def test_a_naive_time_is_refused_by_the_code_email() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        code_message(appointment_start=datetime(2026, 9, 7, 14, 0))
+
+
+# ------------------------------------------------------- cancellation receipt
+
+def cancelled_message(**overrides) -> EmailMessage:
+    kwargs = {
+        "to_email": "patient@example.com",
+        "appointment_start": MON_2PM,
+        "from_email": "clinic@example.com",
+        "from_name": CLINIC_NAME,
+        "patient_name": "Dev",
+        "event_id": "evt-1",
+        **overrides,
+    }
+    return build_cancellation_message(**kwargs)
+
+
+def test_the_receipt_says_cancelled_in_words() -> None:
+    """Mail-client support for METHOD:CANCEL is uneven, so the prose has to carry it."""
+    message = cancelled_message()
+
+    assert "Cancelled" in message["Subject"]
+    assert "cancelled" in body_of(message, "plain")
+    assert "Monday 7 September at 2:00 PM" in body_of(message, "plain")
+
+
+def test_the_receipt_attaches_a_retraction() -> None:
+    attachments = [
+        part for part in cancelled_message().walk()
+        if part.get_filename() == "cancelled.ics"
+    ]
+
+    assert len(attachments) == 1
+    assert "METHOD:CANCEL" in attachments[0].get_content()
+    assert "UID:evt-1@" in attachments[0].get_content()
+
+
+def test_the_retraction_matches_the_uid_of_the_booking() -> None:
+    """Different UIDs would leave the patient with two calendar entries, one a ghost."""
+    booked = [p for p in message(event_id="evt-1").walk()
+              if p.get_filename() == "appointment.ics"][0].get_content()
+    cancelled = [p for p in cancelled_message().walk()
+                 if p.get_filename() == "cancelled.ics"][0].get_content()
+
+    def uid(ics: str) -> str:
+        return next(line for line in ics.splitlines() if line.startswith("UID:"))
+
+    assert uid(booked) == uid(cancelled)
+
+
+def test_a_naive_time_is_refused_by_the_receipt() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        cancelled_message(appointment_start=datetime(2026, 9, 7, 14, 0))
 
 
 # ------------------------------------------------------------------ delivery
@@ -279,3 +406,56 @@ async def test_the_disabled_service_refuses_rather_than_pretending() -> None:
     """Silent success would have the bot promise a mail that never existed."""
     with pytest.raises(EmailError, match="not configured"):
         await DisabledEmailService().send_confirmation("p@example.com", MON_2PM)
+
+
+async def test_the_disabled_service_refuses_a_code_too() -> None:
+    """Which stops the cancellation flow dead, as it should: a code that cannot be sent
+    cannot prove anything, and a prompt for it could never be satisfied."""
+    with pytest.raises(EmailError, match="not configured"):
+        await DisabledEmailService().send_cancellation_code(
+            "p@example.com", "123456", MON_2PM
+        )
+    with pytest.raises(EmailError, match="not configured"):
+        await DisabledEmailService().send_cancellation_confirmation(
+            "p@example.com", MON_2PM
+        )
+
+
+# --------------------------------------------------- delivery of the new messages
+
+async def test_a_code_is_delivered_over_the_same_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+
+    await service().send_cancellation_code("patient@example.com", "123456", MON_2PM, "Dev")
+
+    assert "123456" in FakeSMTP.instances[0].sent[0]["Subject"]
+
+
+async def test_a_code_is_never_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A code in a log line is a code in whatever ships the logs."""
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+
+    with caplog.at_level("DEBUG"):
+        await service().send_cancellation_code(
+            "patient@example.com", "123456", MON_2PM, "Dev"
+        )
+
+    for record in caplog.records:
+        assert "123456" not in record.getMessage()
+        assert "123456" not in str(record.__dict__)
+
+
+async def test_a_cancellation_receipt_is_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+
+    await service().send_cancellation_confirmation(
+        "patient@example.com", MON_2PM, "Dev", "evt-1"
+    )
+
+    assert "Cancelled" in FakeSMTP.instances[0].sent[0]["Subject"]

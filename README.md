@@ -2,11 +2,12 @@
 
 [![CI](https://github.com/0DevDutt0/BrightCare-Clinic-Bot/actions/workflows/ci.yml/badge.svg)](https://github.com/0DevDutt0/BrightCare-Clinic-Bot/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
-![Tests](https://img.shields.io/badge/tests-327%20passing-brightgreen)
-![Phases](https://img.shields.io/badge/phases-5%2F5%20complete-brightgreen)
+![Tests](https://img.shields.io/badge/tests-462%20passing-brightgreen)
+![Phases](https://img.shields.io/badge/phases-6%2F6%20complete-brightgreen)
 
-A conversational agent that answers questions about a clinic and books real
-appointments over Telegram — backed by a live Google Calendar, confirmed by email.
+A conversational agent that answers questions about a clinic, books real appointments
+over Telegram, and cancels them behind a one-time code — backed by a live Google
+Calendar, confirmed by email.
 
 ---
 
@@ -31,6 +32,29 @@ appointments over Telegram — backed by a live Google Calendar, confirmed by em
 That exchange creates a genuine Google Calendar event and delivers a real email with an
 `.ics` attachment. It costs **two LLM calls in total** — both on the first turn.
 
+And it can undo it — but not on your say-so alone:
+
+```
+🧑  I need to cancel my appointment
+🤖  Which email address was the appointment booked with? I'll send a code there to
+    check it's you.
+
+🧑  dev@example.com
+🤖  I found an appointment for Dev on Monday 7 September at 2:00 PM at 12 Orchard Rd,
+    booked with dev@example.com.
+    Shall I cancel it? I'll email a 6-digit code to that address first.
+
+🧑  yes
+🤖  I've emailed a 6-digit code to dev@example.com. It expires in 10 minutes.
+
+🧑  421052
+🤖  Done — your appointment on Monday 7 September at 2:00 PM is cancelled and the
+    slot is free again. I've emailed you a confirmation.
+```
+
+**One LLM call**, on the first message. Telegram proves this is the same chat as
+yesterday; it does not prove which patient that is. The code does.
+
 It also knows when to say no:
 
 | you say | it replies |
@@ -40,6 +64,7 @@ It also knows when to say no:
 | `at 7pm on Tuesday` | We don't have any slots left that late. |
 | `book me for 2:15 on Monday` | The nearest slot is **2:30 PM** — the first opening at or after the time you asked for. |
 | `what's the weather in Paris?` | Sorry, I can't help with that one. |
+| *(cancelling, with an address that booked nothing)* | I couldn't find an upcoming appointment booked with that. **← and no code is emailed** |
 | *(a sticker)* | I can only read text messages right now. **← zero LLM calls** |
 
 ---
@@ -92,23 +117,26 @@ flowchart TD
     S0 -->|empty| A3[ask again]
     S0 -->|text| S1{"Step 1<br/>stage != idle?"}
 
-    S1 -->|"yes — a flow owns it"| F["booking flow<br/><i>deterministic</i>"]
+    S1 -->|"yes — a flow owns it"| F["booking or cancellation flow<br/><i>deterministic</i>"]
     S1 -->|idle| S2["Step 2 — Layer 1<br/>classify intent"]
 
     S2 --> S3{"Step 3<br/>dispatch"}
     S3 --> G[greeting]
     S3 --> Q["faq<br/><i>verbatim from constants</i>"]
     S3 --> B["booking"]
+    S3 --> N["cancel"]
     S3 --> X[out_of_scope]
 
     B --> L2["Layer 2<br/>resolve the time phrase"]
     L2 --> V["scheduling rules"]
     V --> CAL["calendar availability"]
+    N --> LK["find by email<br/>→ one-time code"]
 
     style A1 fill:#d4edda,stroke:#28a745,color:#000
     style A2 fill:#d4edda,stroke:#28a745,color:#000
     style A3 fill:#d4edda,stroke:#28a745,color:#000
     style F fill:#d4edda,stroke:#28a745,color:#000
+    style LK fill:#d4edda,stroke:#28a745,color:#000
     style S2 fill:#e2e3ff,stroke:#5a5ac4,color:#000
     style L2 fill:#e2e3ff,stroke:#5a5ac4,color:#000
 ```
@@ -121,8 +149,9 @@ flowchart TD
 |---|---|
 | a sticker, `/start`, an empty message | **0** |
 | `hi` · `where are you?` · `what's the weather?` | **1** |
+| `I need to cancel my appointment` | **1** — and the whole cancellation is that one |
 | `can I book Monday at 2pm?` | **2** (classify + resolve) |
-| `yes` · `no` · your email address, mid-flow | **0** |
+| `yes` · `no` · your email address · a 6-digit code, mid-flow | **0** |
 
 ### Step 1 before Step 2 is the load-bearing decision
 
@@ -208,6 +237,88 @@ is how two patients end up in one slot.
 
 ---
 
+## The cancellation conversation
+
+Booking is forgiving: a wrong slot is one message away from being fixed. Cancelling is
+not. The appointment is gone, the clinic resells the time, and nobody finds out until
+someone turns up. So this flow asks a question booking never has to: **is the person
+typing entitled to do this?**
+
+Telegram answers a different question. It proves this chat is the same chat as
+yesterday; it says nothing about which patient that is. The only link between a chat and
+an appointment is the email address it was booked with — and an address a stranger can
+type is a claim, not proof.
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> awaiting_cancel_email: "cancel my appointment"
+    awaiting_cancel_email --> awaiting_cancel_email: no match — try another address
+    awaiting_cancel_email --> awaiting_cancel_choice: several found
+    awaiting_cancel_email --> awaiting_cancel_confirmation: exactly one found
+    awaiting_cancel_choice --> awaiting_cancel_confirmation: a number
+    awaiting_cancel_confirmation --> awaiting_cancel_code: "yes" → email a code
+    awaiting_cancel_code --> idle: code ✓ → delete event → receipt
+
+    awaiting_cancel_confirmation --> idle: "no"
+    awaiting_cancel_code --> idle: 3 wrong, or expired
+```
+
+| control | value | why that one |
+|---|---|---|
+| code length | 6 digits | what people expect to retype; the strength is below |
+| attempts | **3** | three guesses against 10⁶ — this, not the length, is the number that matters |
+| expiry | 10 minutes | bounds how long a code left in an inbox stays useful |
+| resends | 3 total | asking again is reasonable; it must not reset the guess budget |
+| addresses tried per flow | 5 | a miss keeps the prompt open, but an open prompt is a free calendar query |
+
+**Only a salted hash is stored.** The plaintext exists in one local variable, long enough
+to be written into an email, then it is gone — so a Redis snapshot, a log line or a
+traceback carries no live code. Six digits is a small space, so this defends against the
+code being *seen*, not against someone who already owns the state; the attempt budget is
+what makes guessing impractical. A test asserts the code appears in neither
+`model_dump_json()` nor the chat history.
+
+### The word `"cancel"` means opposite things in the two flows
+
+| reply | in a booking | in a cancellation |
+|---|---|---|
+| `cancel it` | ❌ no — don't book | ↩️ *ambiguous* — re-ask |
+| `yes cancel it` | ❌ no — a negative anywhere wins | ✅ yes |
+| `no don't cancel` | ❌ no | ❌ no |
+
+`read_yes_no` takes a set of **neutral** words, and the cancellation flow passes
+`{"cancel"}`. Simply dropping the word from the known list would have turned all three
+rows into "unclear", throwing away two answers the user gave plainly.
+
+The same collision reaches the escape hatch. `"cancel"` on its own backs out of whichever
+flow is running — and mid-cancellation the reply is *not* "No problem, I've cleared
+that", which reads as *cleared your appointment*. It says the appointment is still
+booked. That is the one sentence in this app a patient must not misread.
+
+### What it refuses to do
+
+- **No code is ever sent to an address with no appointment.** The bot cannot be used to
+  make mail arrive somewhere.
+- **A code that can't be delivered ends the flow** rather than parking someone at a
+  prompt they could never satisfy.
+- **A calendar 500 is never reported as "already cancelled"** — that would leave a live
+  appointment behind. `EventNotFound` is a distinct exception, and both paths are tested.
+- **An unrecognised reply re-asks; it never reroutes.** Booking hands a puzzling reply
+  back to the classifier, because "actually can we do 4pm?" is a changed request. Nothing
+  at a cancellation prompt reinterprets that way.
+- **A reply that isn't a code costs no attempt.** `"what?"` and `"12345"` are noise, not
+  guesses. Only a well-formed 6-digit guess spends one of the three.
+
+> [!NOTE]
+> **A trade-off worth naming.** The appointment is described *before* the code is sent,
+> which discloses whether a given address has a booking. That is the flow as specified,
+> and the requester has already asserted the address — but the alternative ("if that
+> address has an appointment, I've sent it a code", details only after verification) is a
+> two-line change. See [`prompts/06-cancellation.md`](prompts/06-cancellation.md).
+
+---
+
 ## Two layers, split by what each is trusted with
 
 ```mermaid
@@ -253,6 +364,14 @@ venv/Scripts/pip install -r requirements-dev.txt   # Linux/macOS: venv/bin/pip
 cp .env.example .env                               # then fill in the blanks
 venv/Scripts/python -m uvicorn app.main:app --port 8000
 ```
+
+A **Google service-account key** is one of those blanks, and the only one that is not a
+line in `.env.example` waiting to be filled. `.env.example` points
+`GOOGLE_SERVICE_ACCOUNT_FILE` at `credentials/service-account.json`, a directory
+`.gitignore` covers — so a fresh clone has no key, and because credentials resolve
+eagerly the app exits with a `ConfigurationError` naming the path instead of binding a
+port. Put the key there, or set `GOOGLE_SERVICE_ACCOUNT_JSON` inline; see
+[Configuration](#configuration).
 
 Message the bot on Telegram. `GET /health` reports the resolved run mode.
 
@@ -349,7 +468,37 @@ floor and records why.
 <summary><b>A failed email never rolls back a booked appointment</b></summary>
 
 The calendar event and the email fail independently, and the reply states which of the
-two happened rather than promising a confirmation that never left.
+two happened rather than promising a confirmation that never left. The same rule governs
+cancellation: a broken SMTP server is not a failed cancellation.
+</details>
+
+<details>
+<summary><b>Cancellation asks for the email every time</b> — even when it's already in state</summary>
+
+The same conversation may have booked something ten messages earlier, with
+`patient_email` sitting right there. Reusing it would skip the only step that establishes
+*who is asking*, reducing the one-time code to a formality posted to an address the
+requester never had to know.
+</details>
+
+<details>
+<summary><b>Appointments are found by an exact match done in code</b>, not by trusting search</summary>
+
+Lookup tries an exact `privateExtendedProperty` filter first, then falls back to Google's
+free-text `q` — because events already on the real calendar from Phase 3 carry the
+address only in their prose description. Whatever either query returns is re-matched
+exactly on the address, because `q` tokenises, and **offering someone else's appointment
+for cancellation is the one mistake this must not make.**
+</details>
+
+<details>
+<summary><b>The <code>.ics</code> UID is derived from the Google event id</b></summary>
+
+It used to be a `uuid4()`, which meant nothing could ever refer back to it. The
+cancellation email attaches `METHOD:CANCEL` + `SEQUENCE:1` with the *same* UID, so a
+client that honours the pairing removes the appointment instead of leaving a ghost.
+Support is uneven across mail clients, so the prose says "cancelled" too — the retraction
+is worth sending, not worth relying on.
 </details>
 
 <details>
@@ -467,6 +616,7 @@ flowchart LR
     S --> B["PrivateAttr<br/><i>absent from model_dump()</i>"]
     S --> C["log filter<br/><i>scrubs credential shapes</i>"]
     S --> D[".gitignore + CI scan"]
+    S --> E["salted hash<br/><i>one-time codes never stored</i>"]
     style S fill:#f8d7da,stroke:#dc3545,color:#000
 ```
 
@@ -476,6 +626,11 @@ message bodies, **and** a filter scrubs credential patterns at every level plus 
 from user-content fields at INFO and above. `httpx` is held at WARNING because its INFO
 request line contains the bot token.
 
+A one-time code never reaches state at all — only a salted SHA-256 of it does, compared
+with `secrets.compare_digest`. Six digits is a small space, so that defends against the
+code being *seen* in a snapshot or a traceback rather than against someone who already
+owns the process; the three-attempt budget is what makes guessing impractical.
+
 ---
 
 ## Tests
@@ -484,7 +639,7 @@ request line contains the bot token.
 venv/Scripts/python -m pytest
 ```
 
-**327 tests.** Groq is faked at the `complete_json` seam — the narrowest point that still
+**462 tests.** Groq is faked at the `complete_json` seam — the narrowest point that still
 exercises parsing, validation and error handling. Google is faked at the HTTP layer with
 `respx`, so request bodies are *asserted* rather than assumed.
 
@@ -494,12 +649,14 @@ Several tests assert work **not** done:
 - a mid-flow reply skips the classifier entirely
 - a booking with no time phrase never reaches Layer 2
 - `create_event` never sends an `attendees` key
+- no one-time code is emailed to an address with no appointment
+- a one-time code appears in no reply, no log line, and no serialised state
 
 ### Verified by mutation, not just by passing
 
 Each of these deliberate breakages turns the suite red:
 
-| mutation | caught by |
+| mutation | |
 |---|---|
 | round slots **down** instead of up | 9 tests |
 | drop the weekend check | 5 tests |
@@ -509,6 +666,20 @@ Each of these deliberate breakages turns the suite red:
 | send attendees to Google | 1 test |
 | let a failed email roll back the booking | 1 test |
 | leave a placeholder unsubstituted in a prompt | 1 test |
+| read `"cancel"` as a refusal inside a cancellation | caught |
+| let the plaintext code reach serialised state | caught |
+| draw codes from a predictable source | caught |
+| spend an attempt on a reply that was never a code | caught |
+| delete the event before checking the code | caught |
+| trust Google's free-text search without an exact re-check | caught |
+| report a calendar 500 as "already cancelled" | caught |
+| say "I've cleared that" when backing out of a cancellation | caught |
+
+Twenty mutations were run against the Phase 6 code. Two of them passed on the first
+attempt — the suite had holes at *"reuse the booking address instead of asking"* and
+*"mine a long reply for a stray number at the choice prompt"* — and the tests that close
+them were written in response. The [full list is in
+`prompts/06-cancellation.md`](prompts/06-cancellation.md).
 
 ---
 
@@ -521,10 +692,11 @@ app/
   main.py              FastAPI, lifespan, /health, webhook route
   telegram/            client, handle_update entrypoint, polling runner
   agent/               llm, router (Layer 1), resolver (Layer 2),
-                       orchestrator, prompts, handlers/
+                       orchestrator, prompts, parsing, handlers/
   state/               ConversationState, StateStore + InMemoryStateStore
   domain/business.py   clinic facts, hours, slot grid, booking rule
   domain/scheduling.py business-hours validation, slot alignment
+  domain/otp.py        one-time codes: hashing, expiry, attempt budget
   services/            calendar + email, both live
 prompts/               the prompt driving each phase, with its assumptions
 tests/
@@ -541,5 +713,10 @@ tests/
 | 3 | Calendar availability, slot search, event creation | ✅ complete |
 | 4 | Email confirmation | ✅ complete |
 | 5 | Deployment | ✅ complete |
+| 6 | Cancellation, verified by a one-time code | ✅ complete |
 
 Each phase's prompt and its full assumption list live in [`prompts/`](prompts/).
+
+**Not built:** rescheduling — "move my appointment" still classifies as a booking and
+proposes a new slot without releasing the old one. Cancel-then-rebook works in two turns;
+the bot does not join them up.

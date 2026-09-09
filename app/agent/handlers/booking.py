@@ -23,12 +23,10 @@ the request, not failing to answer it, and the router already knows how to read 
 from __future__ import annotations
 
 import logging
-import re
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from email_validator import EmailNotValidError, validate_email
-
+from app.agent.parsing import extract_email, read_yes_no
 from app.agent.resolver import DatetimeResolver, ResolutionError
 from app.domain.business import CLINIC_ADDRESS, CLINIC_NAME, SLOT_MINUTES
 from app.domain.scheduling import (
@@ -73,68 +71,7 @@ BOOKING_CANCELLED = (
     "whenever you're ready."
 )
 
-_AFFIRMATIVE_WORDS = frozenset(
-    {"yes", "y", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm", "confirmed",
-     "book", "please", "perfect", "great", "correct", "right", "good", "works",
-     "fine", "ahead"}
-)
-_NEGATIVE_WORDS = frozenset(
-    {"no", "n", "nope", "nah", "cancel", "dont", "stop", "never", "not"}
-)
-# Words that carry no decision but commonly pad one: "yeah go ahead", "no thanks".
-_FILLER_WORDS = frozenset(
-    {"thanks", "thank", "you", "that", "thats", "sounds", "go", "it", "then",
-     "lets", "do", "and", "me", "sound", "is", "one", "really", "all"}
-)
-_KNOWN_WORDS = _AFFIRMATIVE_WORDS | _NEGATIVE_WORDS | _FILLER_WORDS
-
-# Longer than this and the message is making a request, not answering yes or no.
-_MAX_SENTIMENT_WORDS = 5
-
-# Apostrophes are dropped before matching so contractions normalise onto the word
-# lists: "that's" -> thats, "don't" -> dont, "let's" -> lets.
-_APOSTROPHES = str.maketrans("", "", "'’")
-_WORD = re.compile(r"[a-z]+")
-_EMAIL_CANDIDATE = re.compile(r"[^\s<>,;]+@[^\s<>,;]+")
-
-
 # --------------------------------------------------------------------- helpers
-
-def _sentiment(text: str) -> bool | None:
-    """True for yes, False for no, None when the reply answers neither.
-
-    Every word must be recognised before a verdict is returned. That is what keeps
-    "ok Tuesday" out of the yes bucket: it opens with an affirmative but carries a
-    day the bot did not propose, so it belongs to the router, not to this question.
-    "yeah go ahead" is entirely known words, so it is a yes.
-
-    A negative anywhere wins, so "no thanks" cannot be read as thanks.
-    """
-    words = _WORD.findall(text.lower().translate(_APOSTROPHES))
-    if not words or len(words) > _MAX_SENTIMENT_WORDS:
-        return None
-    if not set(words) <= _KNOWN_WORDS:
-        return None
-    if set(words) & _NEGATIVE_WORDS:
-        return False
-    if set(words) & _AFFIRMATIVE_WORDS:
-        return True
-    return None
-
-
-def _extract_email(text: str) -> str | None:
-    """Pull a valid address out of a message, or None.
-
-    Validated with email-validator rather than a regex: the regex only finds the
-    candidate. A wrong address means the Phase 4 confirmation silently never arrives.
-    """
-    for candidate in _EMAIL_CANDIDATE.findall(text):
-        try:
-            return validate_email(candidate, check_deliverability=False).normalized
-        except EmailNotValidError:
-            continue
-    return None
-
 
 def _summary_for(state: ConversationState) -> str:
     return f"Appointment - {state.patient_name or 'patient'}"
@@ -257,7 +194,7 @@ async def continue_booking(
 
 
 async def _handle_slot_confirmation(state: ConversationState, text: str) -> str | None:
-    answer = _sentiment(text)
+    answer = read_yes_no(text)
     if answer is None:
         # Not a yes or a no. Most likely a different time -- let the router read it.
         state.reset_flow()
@@ -272,7 +209,7 @@ async def _handle_slot_confirmation(state: ConversationState, text: str) -> str 
 
 
 def _handle_email(state: ConversationState, text: str) -> str | None:
-    email = _extract_email(text)
+    email = extract_email(text)
     if email is None:
         # An address is a specific thing to be asked for, so a reply without one is
         # more likely a typo than a change of subject: ask again rather than reroute.
@@ -295,7 +232,7 @@ async def _handle_final_confirmation(
     calendar: CalendarService,
     email: EmailService,
 ) -> str | None:
-    answer = _sentiment(text)
+    answer = read_yes_no(text)
     if answer is None:
         state.reset_flow()
         return RECLASSIFY
@@ -323,6 +260,7 @@ async def _handle_final_confirmation(
             summary=_summary_for(state),
             description=_description_for(state),
             attendee_email=state.patient_email,
+            patient_name=state.patient_name,
         )
     except CalendarError:
         logger.exception("booking.create_failed")
@@ -337,6 +275,9 @@ async def _handle_final_confirmation(
                 to_email=state.patient_email,
                 appointment_start=slot,
                 patient_name=state.patient_name,
+                # The .ics UID is derived from this, so a later cancellation email can
+                # retract the very event this one added to the patient's calendar.
+                event_id=event_id,
             )
             email_sent = True
         except EmailError:

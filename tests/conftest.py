@@ -22,7 +22,11 @@ from app.agent.orchestrator import Orchestrator
 from app.agent.resolver import DatetimeResolver
 from app.agent.router import IntentRouter
 from app.domain.business import SLOT_DURATION, slot_starts
-from app.services.calendar_service import CalendarService
+from app.services.calendar_service import (
+    Appointment,
+    CalendarService,
+    EventNotFound,
+)
 from app.services.email_service import EmailService
 from app.state.store import InMemoryStateStore
 from app.telegram.handler import UpdateHandler
@@ -87,6 +91,9 @@ class FakeCalendarService(CalendarService):
         # Slots that fall away between proposing and confirming, to exercise the race.
         self.taken_on_next_check: set[datetime] = set()
         self.calls: list[str] = []
+        # Existing appointments the cancellation flow can find, keyed by event id.
+        self.appointments: dict[str, Appointment] = {}
+        self.cancelled: list[str] = []
 
     def _guard(self, call: str) -> None:
         self.calls.append(call)
@@ -125,6 +132,7 @@ class FakeCalendarService(CalendarService):
         summary: str,
         description: str = "",
         attendee_email: str | None = None,
+        patient_name: str | None = None,
     ) -> str:
         self._guard("create_event")
         self.busy.add(start)
@@ -134,23 +142,92 @@ class FakeCalendarService(CalendarService):
                 "summary": summary,
                 "description": description,
                 "attendee_email": attendee_email,
+                "patient_name": patient_name,
             }
         )
-        return f"evt-{len(self.created)}"
+        event_id = f"evt-{len(self.created)}"
+        if attendee_email:
+            # So a booking made in one test is findable by the cancellation flow in the
+            # next line of the same test, exactly as it would be on a real calendar.
+            self.appointments[event_id] = Appointment(
+                event_id=event_id,
+                start=start,
+                summary=summary,
+                patient_email=attendee_email,
+                patient_name=patient_name,
+            )
+        return event_id
+
+    def add_appointment(
+        self,
+        event_id: str,
+        start: datetime,
+        patient_email: str,
+        patient_name: str | None = "Dev",
+    ) -> Appointment:
+        """Seed an appointment the way an earlier booking would have left one."""
+        appointment = Appointment(
+            event_id=event_id,
+            start=start,
+            summary=f"Appointment - {patient_name or 'patient'}",
+            patient_email=patient_email,
+            patient_name=patient_name,
+        )
+        self.appointments[event_id] = appointment
+        self.busy.add(start)
+        return appointment
+
+    async def find_upcoming_by_email(
+        self, email: str, window_start: datetime, window_end: datetime
+    ) -> list[Appointment]:
+        self._guard("find_upcoming_by_email")
+        wanted = email.strip().lower()
+        found = [
+            appointment
+            for appointment in self.appointments.values()
+            if appointment.patient_email.lower() == wanted
+            and window_start <= appointment.start < window_end
+        ]
+        return sorted(found, key=lambda appointment: appointment.start)
+
+    async def cancel_event(self, event_id: str) -> None:
+        self._guard("cancel_event")
+        appointment = self.appointments.pop(event_id, None)
+        if appointment is None:
+            raise EventNotFound(f"no such event: {event_id}")
+        self.busy.discard(appointment.start)
+        self.cancelled.append(event_id)
 
 
 class FakeEmailService(EmailService):
-    """Records confirmations instead of sending them."""
+    """Records mail instead of sending it.
+
+    ``codes`` is the seam the cancellation tests need: the one-time code is deliberately
+    unreachable everywhere else -- not in state, not in a log, not in a reply -- so a
+    test can only learn it by reading what was "delivered", which is also the only way
+    a real user learns it.
+    """
 
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.sent: list[dict[str, Any]] = []
+        self.codes: list[dict[str, Any]] = []
+        self.cancellations: list[dict[str, Any]] = []
+        # Set independently so a test can break only the code mail, or only the receipt.
+        self.code_error: Exception | None = None
+        self.cancellation_error: Exception | None = None
+
+    @property
+    def last_code(self) -> str:
+        assert self.codes, "no cancellation code was sent"
+        return str(self.codes[-1]["code"])
 
     async def send_confirmation(
         self,
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
+        event_id: str | None = None,
     ) -> None:
         if self.error is not None:
             raise self.error
@@ -159,6 +236,43 @@ class FakeEmailService(EmailService):
                 "to_email": to_email,
                 "appointment_start": appointment_start,
                 "patient_name": patient_name,
+                "event_id": event_id,
+            }
+        )
+
+    async def send_cancellation_code(
+        self,
+        to_email: str,
+        code: str,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+    ) -> None:
+        if self.code_error is not None:
+            raise self.code_error
+        self.codes.append(
+            {
+                "to_email": to_email,
+                "code": code,
+                "appointment_start": appointment_start,
+                "patient_name": patient_name,
+            }
+        )
+
+    async def send_cancellation_confirmation(
+        self,
+        to_email: str,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        if self.cancellation_error is not None:
+            raise self.cancellation_error
+        self.cancellations.append(
+            {
+                "to_email": to_email,
+                "appointment_start": appointment_start,
+                "patient_name": patient_name,
+                "event_id": event_id,
             }
         )
 

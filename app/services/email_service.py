@@ -17,6 +17,17 @@ cannot add the patient as a calendar attendee (HTTP 403
 ``forbiddenForServiceAccounts``), so this file is the only way the appointment reaches
 the patient's own calendar. ``METHOD:PUBLISH``, not ``REQUEST`` -- it is a copy to
 save, not an invitation to answer.
+
+Three messages leave here, and they carry different weight:
+
+*The booking confirmation* is a receipt. It can fail without undoing anything.
+
+*The cancellation code* is a credential. If it does not arrive the cancellation cannot
+proceed at all, so its failure aborts the flow rather than being reported and shrugged off.
+
+*The cancellation confirmation* is a receipt again, and its ``.ics`` reuses the UID of
+the booking's -- derived from the Google event id, so the two files are the same event
+to a mail client and the second can retract the first.
 """
 
 from __future__ import annotations
@@ -32,6 +43,7 @@ from email.message import EmailMessage
 from email.utils import formataddr, formatdate
 
 from app.domain.business import CLINIC_ADDRESS, CLINIC_NAME, SLOT_DURATION, SLOT_MINUTES
+from app.domain.otp import MAX_ATTEMPTS, OTP_TTL
 from app.domain.scheduling import format_slot
 
 logger = logging.getLogger(__name__)
@@ -41,13 +53,15 @@ SMTPS_PORT = 465
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
+_OTP_MINUTES = int(OTP_TTL.total_seconds() // 60)
+
 
 class EmailError(RuntimeError):
-    """The confirmation could not be sent."""
+    """The mail could not be sent."""
 
 
 class EmailService(ABC):
-    """Sends appointment confirmations."""
+    """Sends appointment confirmations, cancellation codes and cancellation receipts."""
 
     @abstractmethod
     async def send_confirmation(
@@ -55,18 +69,46 @@ class EmailService(ABC):
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
+        event_id: str | None = None,
     ) -> None:
         """Email a confirmation for an appointment at ``appointment_start`` (aware)."""
+
+    @abstractmethod
+    async def send_cancellation_code(
+        self,
+        to_email: str,
+        code: str,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+    ) -> None:
+        """Email the one-time code that authorises cancelling that appointment."""
+
+    @abstractmethod
+    async def send_cancellation_confirmation(
+        self,
+        to_email: str,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        """Email a receipt for an appointment that has just been cancelled."""
 
 
 # ------------------------------------------------------------------ construction
 
-def build_ics(start: datetime, uid: str | None = None) -> str:
+def build_ics(start: datetime, uid: str | None = None, *, cancelled: bool = False) -> str:
     """A minimal VEVENT the patient's mail client can add to their own calendar.
 
     Times are emitted in UTC with a trailing Z, which every client understands and
     which sidesteps having to ship a VTIMEZONE block. Lines are CRLF-terminated as
     RFC 5545 requires, and kept short so none needs folding.
+
+    ``uid`` should be the Google event id. Deriving the UID from it rather than from a
+    fresh uuid4 is what lets the cancellation file refer to the same event as the
+    booking file, so a client that honours ``METHOD:CANCEL`` removes the appointment
+    instead of adding a second copy of it. Support for that pairing is uneven across
+    mail clients -- the retraction is worth sending, not worth relying on, which is why
+    the message says in words that the appointment is cancelled.
     """
     if start.tzinfo is None or start.tzinfo.utcoffset(start) is None:
         raise ValueError("build_ics requires a timezone-aware datetime")
@@ -80,20 +122,41 @@ def build_ics(start: datetime, uid: str | None = None) -> str:
         f"PRODID:-//{CLINIC_NAME}//Booking Assistant//EN",
         "CALSCALE:GREGORIAN",
         # PUBLISH, not REQUEST: this is a copy to save, not an invitation to answer.
-        "METHOD:PUBLISH",
+        "METHOD:CANCEL" if cancelled else "METHOD:PUBLISH",
         "BEGIN:VEVENT",
         f"UID:{uid or uuid.uuid4()}@brightcare.invalid",
+        # A retraction must outrank the original, or a client keeps the one it has.
+        f"SEQUENCE:{1 if cancelled else 0}",
         f"DTSTAMP:{stamp(datetime.now(timezone.utc))}",
         f"DTSTART:{stamp(start)}",
         f"DTEND:{stamp(start + SLOT_DURATION)}",
         f"SUMMARY:Appointment at {CLINIC_NAME}",
         f"LOCATION:{CLINIC_ADDRESS}",
         f"DESCRIPTION:Your {SLOT_MINUTES}-minute appointment at {CLINIC_NAME}.",
-        "STATUS:CONFIRMED",
+        "STATUS:CANCELLED" if cancelled else "STATUS:CONFIRMED",
         "END:VEVENT",
         "END:VCALENDAR",
     ]
     return "\r\n".join(lines) + "\r\n"
+
+
+def _envelope(
+    subject: str, to_email: str, from_email: str, from_name: str
+) -> EmailMessage:
+    """The headers every message here shares."""
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = formataddr((from_name, from_email))
+    message["To"] = to_email
+    message["Date"] = formatdate(localtime=True)
+    return message
+
+
+def _require_aware_start(appointment_start: datetime) -> None:
+    if appointment_start.tzinfo is None or appointment_start.tzinfo.utcoffset(
+        appointment_start
+    ) is None:
+        raise ValueError("appointment_start must be timezone-aware")
 
 
 def build_confirmation_message(
@@ -102,21 +165,17 @@ def build_confirmation_message(
     from_email: str,
     from_name: str,
     patient_name: str | None = None,
+    event_id: str | None = None,
 ) -> EmailMessage:
     """Assemble the confirmation. Pure: no I/O, no configuration lookup."""
-    if appointment_start.tzinfo is None or appointment_start.tzinfo.utcoffset(
-        appointment_start
-    ) is None:
-        raise ValueError("appointment_start must be timezone-aware")
+    _require_aware_start(appointment_start)
 
     when = format_slot(appointment_start)
     greeting = f"Hello {patient_name}," if patient_name else "Hello,"
 
-    message = EmailMessage()
-    message["Subject"] = f"Your appointment at {CLINIC_NAME} - {when}"
-    message["From"] = formataddr((from_name, from_email))
-    message["To"] = to_email
-    message["Date"] = formatdate(localtime=True)
+    message = _envelope(
+        f"Your appointment at {CLINIC_NAME} - {when}", to_email, from_email, from_name
+    )
 
     message.set_content(
         f"{greeting}\n\n"
@@ -146,10 +205,134 @@ def build_confirmation_message(
     )
 
     message.add_attachment(
-        build_ics(appointment_start).encode("utf-8"),
+        build_ics(appointment_start, event_id).encode("utf-8"),
         maintype="text",
         subtype="calendar",
         filename="appointment.ics",
+    )
+    return message
+
+
+def build_cancellation_code_message(
+    to_email: str,
+    code: str,
+    appointment_start: datetime,
+    from_email: str,
+    from_name: str,
+    patient_name: str | None = None,
+) -> EmailMessage:
+    """Assemble the one-time code mail. Pure: no I/O, no configuration lookup.
+
+    The code is in the subject line as well as the body, which is where a phone's
+    notification will show it. That is a deliberate exposure and a small one: the code
+    is single-use, dies in ten minutes, and cancels exactly one named appointment.
+
+    The last line matters more than it looks. Anyone can start this flow by typing
+    somebody else's address, so the real owner has to be told, in the mail itself, that
+    ignoring it leaves their appointment untouched.
+    """
+    _require_aware_start(appointment_start)
+
+    when = format_slot(appointment_start)
+    greeting = f"Hello {patient_name}," if patient_name else "Hello,"
+
+    message = _envelope(
+        f"{code} is your code to cancel your {CLINIC_NAME} appointment",
+        to_email,
+        from_email,
+        from_name,
+    )
+
+    message.set_content(
+        f"{greeting}\n\n"
+        f"Someone asked to cancel this appointment on Telegram:\n\n"
+        f"  When:  {when}\n"
+        f"  Where: {CLINIC_ADDRESS}\n\n"
+        f"Your confirmation code is:\n\n"
+        f"    {code}\n\n"
+        f"Enter it in the chat within {_OTP_MINUTES} minutes to cancel. "
+        f"You get {MAX_ATTEMPTS} attempts.\n\n"
+        "If this wasn't you, ignore this email - nothing has been cancelled and your "
+        "appointment stands.\n\n"
+        f"{CLINIC_NAME}\n"
+    )
+
+    message.add_alternative(
+        f"""\
+<html><body style="font-family:system-ui,sans-serif;color:#1a1a1a">
+  <p>{greeting}</p>
+  <p>Someone asked to cancel this appointment on Telegram:</p>
+  <table cellpadding="6" style="border-collapse:collapse">
+    <tr><td><strong>When</strong></td><td>{when}</td></tr>
+    <tr><td><strong>Where</strong></td><td>{CLINIC_ADDRESS}</td></tr>
+  </table>
+  <p>Your confirmation code is:</p>
+  <p style="font-size:28px;letter-spacing:6px;font-weight:700">{code}</p>
+  <p>Enter it in the chat within {_OTP_MINUTES} minutes to cancel.
+     You get {MAX_ATTEMPTS} attempts.</p>
+  <p><strong>If this wasn't you, ignore this email</strong> - nothing has been
+     cancelled and your appointment stands.</p>
+  <p>{CLINIC_NAME}</p>
+</body></html>
+""",
+        subtype="html",
+    )
+    # No .ics here. This mail is a credential, not a record of an appointment.
+    return message
+
+
+def build_cancellation_message(
+    to_email: str,
+    appointment_start: datetime,
+    from_email: str,
+    from_name: str,
+    patient_name: str | None = None,
+    event_id: str | None = None,
+) -> EmailMessage:
+    """Assemble the cancellation receipt. Pure: no I/O, no configuration lookup."""
+    _require_aware_start(appointment_start)
+
+    when = format_slot(appointment_start)
+    greeting = f"Hello {patient_name}," if patient_name else "Hello,"
+
+    message = _envelope(
+        f"Cancelled - your appointment at {CLINIC_NAME} on {when}",
+        to_email,
+        from_email,
+        from_name,
+    )
+
+    message.set_content(
+        f"{greeting}\n\n"
+        f"Your appointment at {CLINIC_NAME} has been cancelled.\n\n"
+        f"  Was:   {when}\n"
+        f"  Where: {CLINIC_ADDRESS}\n\n"
+        "Nothing further is needed. To book another time, just message us on "
+        "Telegram.\n\n"
+        f"{CLINIC_NAME}\n"
+    )
+
+    message.add_alternative(
+        f"""\
+<html><body style="font-family:system-ui,sans-serif;color:#1a1a1a">
+  <p>{greeting}</p>
+  <p>Your appointment at <strong>{CLINIC_NAME}</strong> has been cancelled.</p>
+  <table cellpadding="6" style="border-collapse:collapse">
+    <tr><td><strong>Was</strong></td><td><s>{when}</s></td></tr>
+    <tr><td><strong>Where</strong></td><td>{CLINIC_ADDRESS}</td></tr>
+  </table>
+  <p>Nothing further is needed. To book another time, just message us on Telegram.</p>
+  <p>{CLINIC_NAME}</p>
+</body></html>
+""",
+        subtype="html",
+    )
+
+    message.add_attachment(
+        build_ics(appointment_start, event_id, cancelled=True).encode("utf-8"),
+        maintype="text",
+        subtype="calendar",
+        filename="cancelled.ics",
     )
     return message
 
@@ -182,14 +365,63 @@ class SmtpEmailService(EmailService):
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
+        event_id: str | None = None,
     ) -> None:
-        message = build_confirmation_message(
-            to_email=to_email,
-            appointment_start=appointment_start,
-            from_email=self._from_email,
-            from_name=self._from_name,
-            patient_name=patient_name,
+        await self._send(
+            build_confirmation_message(
+                to_email=to_email,
+                appointment_start=appointment_start,
+                from_email=self._from_email,
+                from_name=self._from_name,
+                patient_name=patient_name,
+                event_id=event_id,
+            ),
+            to_email,
+            kind="confirmation",
         )
+
+    async def send_cancellation_code(
+        self,
+        to_email: str,
+        code: str,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+    ) -> None:
+        await self._send(
+            build_cancellation_code_message(
+                to_email=to_email,
+                code=code,
+                appointment_start=appointment_start,
+                from_email=self._from_email,
+                from_name=self._from_name,
+                patient_name=patient_name,
+            ),
+            to_email,
+            kind="cancellation_code",
+        )
+
+    async def send_cancellation_confirmation(
+        self,
+        to_email: str,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        await self._send(
+            build_cancellation_message(
+                to_email=to_email,
+                appointment_start=appointment_start,
+                from_email=self._from_email,
+                from_name=self._from_name,
+                patient_name=patient_name,
+                event_id=event_id,
+            ),
+            to_email,
+            kind="cancellation",
+        )
+
+    async def _send(self, message: EmailMessage, to_email: str, *, kind: str) -> None:
+        """Deliver one built message, mapping SMTP failures onto :class:`EmailError`."""
         try:
             await asyncio.to_thread(self._deliver, message)
         except smtplib.SMTPAuthenticationError as exc:
@@ -202,8 +434,12 @@ class SmtpEmailService(EmailService):
         except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
             raise EmailError(f"could not send the email: {type(exc).__name__}") from exc
 
-        # The recipient is never logged: it is the one piece of patient data here.
-        logger.info("email.sent", extra={"recipient_domain": to_email.rsplit("@", 1)[-1]})
+        # Neither the recipient nor, for a code mail, anything of its contents: only the
+        # domain, which is what actually helps when SMTP starts refusing one provider.
+        logger.info(
+            "email.sent",
+            extra={"kind": kind, "recipient_domain": to_email.rsplit("@", 1)[-1]},
+        )
 
     def _deliver(self, message: EmailMessage) -> None:
         """Blocking SMTP send. Runs in a thread; never call from the event loop."""
@@ -227,12 +463,37 @@ class DisabledEmailService(EmailService):
 
     Raises rather than silently succeeding: a caller that believes it sent a
     confirmation would tell the patient so, and nothing would arrive.
+
+    For booking that is a degraded but working service -- the appointment is real, and
+    the reply says no email is coming. For cancellation it is a closed door, since the
+    code has nowhere to go; the flow stops and says so rather than pretending to verify.
     """
+
+    _MESSAGE = "SMTP is not configured; set the SMTP_* environment variables"
 
     async def send_confirmation(
         self,
         to_email: str,
         appointment_start: datetime,
         patient_name: str | None = None,
+        event_id: str | None = None,
     ) -> None:
-        raise EmailError("SMTP is not configured; set the SMTP_* environment variables")
+        raise EmailError(self._MESSAGE)
+
+    async def send_cancellation_code(
+        self,
+        to_email: str,
+        code: str,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+    ) -> None:
+        raise EmailError(self._MESSAGE)
+
+    async def send_cancellation_confirmation(
+        self,
+        to_email: str,
+        appointment_start: datetime,
+        patient_name: str | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        raise EmailError(self._MESSAGE)

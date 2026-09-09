@@ -10,8 +10,12 @@ and only a message that survives all of them costs a classification:
   Step 3  dispatch           -- one handler, chosen from the validated intent.
 
 Only the booking handler goes further, spending a second call on Layer 2 to resolve
-the time phrase. Greetings, FAQs and refusals cost exactly one call; a message that
-never reaches Step 2 costs none.
+the time phrase. Greetings, FAQs, refusals and cancellations cost exactly one call; a
+message that never reaches Step 2 costs none.
+
+Step 1 dispatches on which flow owns the stage. Booking may hand a puzzling reply back
+to the classifier; cancellation never does -- see
+:mod:`app.agent.handlers.cancellation`.
 
 Step 1 before Step 2 is the part that is easy to get wrong. If a user has been asked
 "is 2pm alright?" and replies "yes", classifying that message in isolation yields
@@ -27,6 +31,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from app.agent.handlers.booking import continue_booking, start_booking
+from app.agent.handlers.cancellation import continue_cancellation, start_cancellation
 from app.agent.handlers.faq import faq_reply
 from app.agent.handlers.greeting import greeting_reply
 from app.agent.handlers.out_of_scope import out_of_scope_reply
@@ -47,15 +52,39 @@ TROUBLE_MESSAGE = (
 )
 CLARIFY_MESSAGE = (
     "I'm not sure I understood. You can ask about the clinic - location, hours, "
-    "parking, or walk-ins - or tell me a day and time to book an appointment."
+    "parking, or walk-ins - tell me a day and time to book an appointment, or say "
+    "you'd like to cancel one."
 )
 FLOW_CLEARED = f"No problem, I've cleared that. {CAPABILITIES}"
+# Backing out of a *cancellation* needs its own wording. "I've cleared that" is fine
+# when the abandoned flow was a booking, and dangerously readable as "cleared your
+# appointment" when it was not -- the one sentence a patient must not misread.
+CANCELLATION_ABANDONED = (
+    "Alright, I've stopped there - nothing has been cancelled and your appointment is "
+    f"still booked. {CAPABILITIES}"
+)
 
 COMMANDS = frozenset({"/start", "/help"})
+
+# Stages owned by the cancellation flow. Everything else non-idle belongs to booking.
+CANCELLATION_STAGES = frozenset(
+    {
+        "awaiting_cancel_email",
+        "awaiting_cancel_choice",
+        "awaiting_cancel_confirmation",
+        "awaiting_cancel_code",
+    }
+)
 
 # Deterministic mid-flow escape hatch. Keyword matching keeps it free: recognising a
 # topic change with the model would cost a classification on every in-flow message,
 # and these are the phrases users actually type to back out.
+#
+# "cancel" is here, and it is the one entry that means two things. The match is on the
+# *whole* message, so a bare "cancel" backs out of whatever flow is running while
+# "cancel my appointment" falls through to be classified -- which is the reading a user
+# who is mid-booking wants, and the safe reading for a user who is mid-cancellation,
+# since backing out cancels nothing.
 ESCAPE_PHRASES = frozenset(
     {
         "cancel", "stop", "nevermind", "never mind", "start over", "restart",
@@ -142,12 +171,30 @@ class Orchestrator:
         # --- Step 1: active flow owns the message ------------------------------
         if state.is_active:
             stage = state.stage
+            cancelling = stage in CANCELLATION_STAGES
+
             if stripped.lower() in ESCAPE_PHRASES:
                 state.reset_flow()
                 logger.info(
                     "orchestrator.flow_cleared", extra={"chat_id": chat_id, "stage": stage}
                 )
-                return await self._finish(state, Reply(FLOW_CLEARED, "flow_cleared"))
+                cleared = CANCELLATION_ABANDONED if cancelling else FLOW_CLEARED
+                return await self._finish(state, Reply(cleared, "flow_cleared"))
+
+            if cancelling:
+                # Cancellation always answers: it has no reclassify path, because
+                # nothing at one of its prompts reinterprets as a different request,
+                # and dropping the flow silently while confirming a destructive action
+                # is the wrong instinct.
+                return await self._finish(
+                    state,
+                    Reply(
+                        await continue_cancellation(
+                            state, stripped, self._calendar, self._email, self._now()
+                        ),
+                        f"continuation.{stage}",
+                    ),
+                )
 
             flow_reply = await continue_booking(
                 state, stripped, self._calendar, self._email, self._now(), self._tz
@@ -202,6 +249,11 @@ class Orchestrator:
                 self._now(),
                 self._tz,
             )
+        elif intent == "cancel":
+            # No Layer 2 call: which appointment is settled by the calendar lookup and,
+            # where several match, by the user picking a number -- both cheaper and more
+            # certain than resolving "Monday" and hoping it names only one of them.
+            text_out = start_cancellation(state)
         else:
             text_out = out_of_scope_reply()
 

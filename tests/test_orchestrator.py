@@ -42,6 +42,7 @@ CHAT_ID = 555
         ("faq", "location", CLINIC_ADDRESS),
         ("faq", "walk_ins", "appointment only"),
         ("out_of_scope", None, "can't help with that"),
+        ("cancel", None, "email address"),
     ],
 )
 async def test_each_intent_routes_to_its_handler(
@@ -149,9 +150,58 @@ async def test_a_rejected_request_leaves_the_conversation_idle(
 
 # ------------------------------------------------- state precedence over intent
 
+async def test_cancelling_costs_one_model_call_and_never_reaches_layer_two(
+    orchestrator: Orchestrator, fake_llm: FakeGroqClient, store
+) -> None:
+    """Which appointment is settled by the calendar and a numbered choice, not by
+    resolving a phrase and hoping it names exactly one."""
+    fake_llm.queue(classification("cancel", raw_datetime_text="Monday"))
+
+    reply = await orchestrator.handle(CHAT_ID, {"text": "cancel my Monday appointment"})
+
+    assert fake_llm.call_count == 1
+    assert reply.intent == "cancel"
+    assert (await store.get(CHAT_ID)).stage == "awaiting_cancel_email"
+
+
+async def test_asking_how_to_cancel_answers_instead_of_starting_the_flow(
+    orchestrator: Orchestrator, fake_llm: FakeGroqClient, store
+) -> None:
+    """A question deserves an answer, not an unrequested destructive flow."""
+    fake_llm.queue(classification("faq", faq_topic="cancellation"))
+
+    reply = await orchestrator.handle(CHAT_ID, {"text": "how do I cancel?"})
+
+    assert reply.text == FAQ_FACTS["cancellation"]
+    assert (await store.get(CHAT_ID)).stage == "idle"
+
+
+async def test_starting_a_cancellation_abandons_a_booking_in_flight(
+    orchestrator: Orchestrator, fake_llm: FakeGroqClient, store
+) -> None:
+    """Two flows cannot share one stage field, and the newer request is the live one."""
+    fake_llm.queue(classification("booking", raw_datetime_text="Monday at 2pm"))
+    fake_llm.queue(resolution("2026-09-07", "14:00"))
+    await orchestrator.handle(CHAT_ID, {"text": "book Monday at 2pm"})
+
+    fake_llm.queue(classification("cancel"))
+    await orchestrator.handle(CHAT_ID, {"text": "actually I need to cancel one"})
+
+    state = await store.get(CHAT_ID)
+    assert state.stage == "awaiting_cancel_email"
+    assert state.proposed_start is None
+
+
 @pytest.mark.parametrize(
     "stage",
-    ["awaiting_slot_confirmation", "awaiting_email", "awaiting_final_confirmation"],
+    [
+        "awaiting_slot_confirmation",
+        "awaiting_email",
+        "awaiting_final_confirmation",
+        "awaiting_cancel_email",
+        "awaiting_cancel_confirmation",
+        "awaiting_cancel_code",
+    ],
 )
 async def test_active_flow_bypasses_the_classifier_entirely(
     orchestrator: Orchestrator, fake_llm: FakeGroqClient, store, stage: str

@@ -56,8 +56,9 @@ FAQ_FACTS: dict[str, str] = {
         "The clinic does not accept walk-ins. Visits are by appointment only."
     ),
     "cancellation": (
-        "To cancel or change an appointment, send a message to the clinic here and "
-        "the team will take care of it."
+        "To cancel an appointment, just tell me here. I'll ask which email address you "
+        "booked with, send a 6-digit code to it to check it's you, and cancel the "
+        "appointment once you've entered the code."
     ),
     "parking": "On-site parking is available at the clinic.",
     "appointment_length": f"Each appointment is {SLOT_MINUTES} minutes long.",
@@ -65,12 +66,13 @@ FAQ_FACTS: dict[str, str] = {
 
 CAPABILITIES = (
     "I can answer questions about the clinic -- our location, opening hours, parking, "
-    "and how appointments work -- and I can help you book an appointment."
+    "and how appointments work -- and I can book an appointment for you or cancel one."
 )
 
 WELCOME = (
     f"Hello, and welcome to {CLINIC_NAME}. {CAPABILITIES}\n\n"
-    "Try asking \"where are you located?\" or \"can I book Monday at 2pm?\""
+    "Try asking \"where are you located?\", \"can I book Monday at 2pm?\" or "
+    "\"I need to cancel my appointment\"."
 )
 
 

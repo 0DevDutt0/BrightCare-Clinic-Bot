@@ -24,7 +24,7 @@ from app.domain.business import FAQ_FACTS
 
 logger = logging.getLogger(__name__)
 
-Intent = Literal["greeting", "faq", "booking", "out_of_scope"]
+Intent = Literal["greeting", "faq", "booking", "cancel", "out_of_scope"]
 
 # Below this the classifier is guessing, so the bot asks instead of acting.
 MIN_CONFIDENCE = 0.6

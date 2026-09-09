@@ -2,8 +2,9 @@
 
 Talks to the REST API over httpx rather than through google-api-python-client. That
 client is synchronous and builds its own HTTP stack, which in an async app means either
-blocking the event loop or wrapping every call in a thread. Only four endpoints are
-needed here, so the REST calls are written directly and the app keeps one HTTP library.
+blocking the event loop or wrapping every call in a thread. Only a handful of endpoints
+are needed here -- freeBusy, and listing, creating and deleting events -- so the REST
+calls are written directly and the app keeps one HTTP library.
 
 ``google-auth`` is still used for the part that genuinely needs it -- signing the
 service-account JWT -- but its default transport wants ``requests``, so an httpx
@@ -26,9 +27,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -46,6 +50,20 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 # Refresh slightly before expiry so a request never races the token going stale.
 TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
 
+# Where the patient's address is stored for machine lookup. Private extended properties
+# are invisible to anyone reading the calendar and, unlike the description, can be
+# filtered on server-side with an exact match.
+PATIENT_EMAIL_PROPERTY = "patient_email"
+PATIENT_NAME_PROPERTY = "patient_name"
+
+# One page is plenty: this is one patient's upcoming appointments, not a calendar dump.
+MAX_SEARCH_RESULTS = 50
+
+# The description shape written before extended properties existed. Events already on a
+# real calendar carry the address only here, so cancellation still has to read it.
+_DESCRIPTION_EMAIL = re.compile(r"Patient email:\s*(\S+)", re.IGNORECASE)
+_DESCRIPTION_NAME = re.compile(r"^Patient:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+
 
 class CalendarError(RuntimeError):
     """The calendar could not be read or written."""
@@ -53,6 +71,26 @@ class CalendarError(RuntimeError):
 
 class SlotTaken(CalendarError):
     """The requested slot was free when proposed and is not any more."""
+
+
+class EventNotFound(CalendarError):
+    """The event is not on the calendar: already cancelled, or never there.
+
+    A subclass so that every existing ``except CalendarError`` still catches it, while a
+    caller that cares -- cancellation, which should say "already gone" rather than
+    "something broke" -- can single it out.
+    """
+
+
+@dataclass(frozen=True)
+class Appointment:
+    """One upcoming appointment, as the calendar knows it."""
+
+    event_id: str
+    start: datetime
+    summary: str
+    patient_email: str
+    patient_name: str | None = None
 
 
 class CalendarService(ABC):
@@ -84,8 +122,23 @@ class CalendarService(ABC):
         summary: str,
         description: str = "",
         attendee_email: str | None = None,
+        patient_name: str | None = None,
     ) -> str:
         """Create the appointment; returns the created event id."""
+
+    @abstractmethod
+    async def find_upcoming_by_email(
+        self, email: str, window_start: datetime, window_end: datetime
+    ) -> list[Appointment]:
+        """Appointments booked with ``email`` that start inside the window, soonest first.
+
+        The window is passed in rather than read from a clock, matching
+        :meth:`list_busy` -- this class owns no notion of "now".
+        """
+
+    @abstractmethod
+    async def cancel_event(self, event_id: str) -> None:
+        """Remove one appointment. Raises :class:`EventNotFound` if it is already gone."""
 
 
 # --------------------------------------------------------------------- transport
@@ -208,6 +261,12 @@ class GoogleCalendarService(CalendarService):
 
         if response.status_code in (200, 201, 204):
             return response.json() if response.content else None
+        if response.status_code in (404, 410):
+            # 410 Gone is what Google returns for an event deleted from under us.
+            raise EventNotFound(
+                f"calendar has no such resource ({method} {path}): "
+                f"{_describe_error(response)}"
+            )
         raise CalendarError(
             f"calendar API rejected {method} {path} "
             f"(HTTP {response.status_code}): {_describe_error(response)}"
@@ -269,6 +328,94 @@ class GoogleCalendarService(CalendarService):
         busy = await self.list_busy(start, start + SLOT_DURATION)
         return not _overlaps_any(start, busy)
 
+    async def find_upcoming_by_email(
+        self, email: str, window_start: datetime, window_end: datetime
+    ) -> list[Appointment]:
+        """Find this patient's upcoming appointments.
+
+        Two queries, tried in order, because the calendar holds two generations of event:
+
+        1. ``privateExtendedProperty`` -- an exact server-side match on the address
+           written by :meth:`create_event`. No false positives, one request.
+        2. ``q`` free text -- the fallback for events booked before that property
+           existed, which carry the address only in their prose description.
+
+        Whatever either query returns is then matched **exactly** on the address in
+        code. Google's free-text search tokenises, so ``q`` alone could hand back a
+        near-miss, and offering someone else's appointment for cancellation is the one
+        mistake this function must not make.
+        """
+        _require_aware(window_start, "window_start")
+        _require_aware(window_end, "window_end")
+        wanted = email.strip().lower()
+        if not wanted:
+            return []
+
+        items = await self._search_events(
+            window_start,
+            window_end,
+            {"privateExtendedProperty": f"{PATIENT_EMAIL_PROPERTY}={wanted}"},
+        )
+        if not items:
+            items = await self._search_events(window_start, window_end, {"q": wanted})
+
+        found = [
+            appointment
+            for appointment in (self._to_appointment(item) for item in items)
+            if appointment is not None and appointment.patient_email.lower() == wanted
+        ]
+        found.sort(key=lambda appointment: appointment.start)
+        logger.info("calendar.lookup_by_email", extra={"match_count": len(found)})
+        return found
+
+    async def _search_events(
+        self, window_start: datetime, window_end: datetime, criteria: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        payload = await self._call(
+            "GET",
+            f"/calendars/{self._calendar_id}/events",
+            params={
+                "timeMin": window_start.isoformat(),
+                "timeMax": window_end.isoformat(),
+                # Expand recurrence, so an event id names one occurrence and cancelling
+                # it cannot take a whole series with it.
+                "singleEvents": "true",
+                "orderBy": "startTime",
+                "maxResults": MAX_SEARCH_RESULTS,
+                **criteria,
+            },
+        )
+        items = (payload or {}).get("items", [])
+        return [item for item in items if isinstance(item, dict)]
+
+    def _to_appointment(self, event: dict[str, Any]) -> Appointment | None:
+        """Read one API event, or None when it is not a bookable appointment."""
+        event_id = event.get("id")
+        start_value = (event.get("start") or {}).get("dateTime")
+        if not event_id or not start_value:
+            # An all-day entry has "date" instead of "dateTime": a clinic closure or a
+            # note, never a 30-minute appointment.
+            return None
+        if event.get("status") == "cancelled":
+            return None
+
+        private = (event.get("extendedProperties") or {}).get("private") or {}
+        description = str(event.get("description") or "")
+        email = private.get(PATIENT_EMAIL_PROPERTY) or _first_group(
+            _DESCRIPTION_EMAIL, description
+        )
+        if not email:
+            return None
+
+        return Appointment(
+            event_id=str(event_id),
+            start=_parse_rfc3339(start_value).astimezone(self._tz),
+            summary=str(event.get("summary") or ""),
+            patient_email=str(email).strip(),
+            patient_name=private.get(PATIENT_NAME_PROPERTY)
+            or _first_group(_DESCRIPTION_NAME, description),
+        )
+
     # ------------------------------------------------------------- write side
 
     async def create_event(
@@ -277,6 +424,7 @@ class GoogleCalendarService(CalendarService):
         summary: str,
         description: str = "",
         attendee_email: str | None = None,
+        patient_name: str | None = None,
     ) -> str:
         _require_aware(start, "start")
         body: dict[str, Any] = {
@@ -288,12 +436,21 @@ class GoogleCalendarService(CalendarService):
                 "timeZone": str(self._tz),
             },
         }
+
+        private: dict[str, str] = {}
         if attendee_email:
             # Never sent as an attendee: see the module docstring. Recorded so the
-            # clinic can still see who booked from the event alone.
+            # clinic can still see who booked from the event alone -- and, lowercased,
+            # as a private property, so cancellation can find it by exact match instead
+            # of by searching prose.
             body["description"] = (
                 f"{description}\n\nPatient email: {attendee_email}".strip()
             )
+            private[PATIENT_EMAIL_PROPERTY] = attendee_email.strip().lower()
+        if patient_name:
+            private[PATIENT_NAME_PROPERTY] = patient_name
+        if private:
+            body["extendedProperties"] = {"private": private}
 
         payload = await self._call(
             "POST",
@@ -306,6 +463,25 @@ class GoogleCalendarService(CalendarService):
             raise CalendarError("calendar accepted the event but returned no id")
         logger.info("calendar.event_created", extra={"event_id": event_id})
         return str(event_id)
+
+    async def cancel_event(self, event_id: str) -> None:
+        """Delete the appointment, freeing the slot for someone else.
+
+        A delete rather than a ``status: cancelled`` patch. Google hides cancelled
+        events from ``freeBusy`` either way, so the slot returns in both cases; delete
+        is the operation that says what happened, and a clinic that needs an audit trail
+        needs a record of its own, not a tombstone on a calendar Google eventually purges.
+        """
+        if not event_id:
+            raise ValueError("cancel_event requires an event id")
+        await self._call(
+            "DELETE",
+            # Quoted: this id comes back out of conversation state, and a path segment
+            # is the one place an unexpected character would change which URL is called.
+            f"/calendars/{self._calendar_id}/events/{quote(event_id, safe='')}",
+            params={"sendUpdates": "none"},
+        )
+        logger.info("calendar.event_cancelled", extra={"event_id": event_id})
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -321,6 +497,12 @@ def _require_aware(moment: datetime, label: str) -> None:
 def _parse_rfc3339(value: str) -> datetime:
     """Parse a Google timestamp. Handles the trailing 'Z' fromisoformat once refused."""
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _first_group(pattern: re.Pattern[str], text: str) -> str | None:
+    """First capture of ``pattern`` in ``text``, stripped, or None."""
+    match = pattern.search(text)
+    return match.group(1).strip() if match else None
 
 
 def _overlaps_any(slot: datetime, busy: list[tuple[datetime, datetime]]) -> bool:

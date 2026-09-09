@@ -28,12 +28,15 @@ Choose exactly one intent:
 - "booking"      - wants to make, move, or ask about the availability of an
                    appointment. Includes messages that only name a time, such as
                    "tomorrow at 3" or "is Friday morning free?".
+- "cancel"       - wants to call off an appointment they have already booked:
+                   "cancel my appointment", "I need to cancel Monday",
+                   "something came up, I can't make it".
 - "out_of_scope" - anything else: weather, general medical advice, jokes, other
                    businesses, or any topic unrelated to this clinic.
 
 Return these fields:
 {
-  "intent": one of "greeting" | "faq" | "booking" | "out_of_scope",
+  "intent": one of "greeting" | "faq" | "booking" | "cancel" | "out_of_scope",
   "confidence": a number from 0.0 to 1.0 - how certain you are of the intent,
   "faq_topic": __TOPICS__ or null,
   "raw_datetime_text": string or null
@@ -42,6 +45,9 @@ Return these fields:
 Rules:
 - "faq_topic" is non-null only when intent is "faq". If the message is an FAQ but
   matches none of the listed topics, use null.
+- "cancel" is for calling off a real booking. A question ABOUT cancelling - "how do
+  I cancel?", "what's your cancellation policy?" - is "faq" with the "cancellation"
+  topic, not "cancel".
 - "raw_datetime_text" must be copied VERBATIM from the user's message - the exact
   substring they typed, such as "Monday at 2pm" or "tomorrow morning". Do NOT
   convert it to a date, a time, or any other format. Use null when no time is
@@ -68,6 +74,15 @@ message: "can I book Monday at 2pm?"
 
 message: "anything free tomorrow morning?"
 {"intent": "booking", "confidence": 0.92, "faq_topic": null, "raw_datetime_text": "tomorrow morning"}
+
+message: "I need to cancel my appointment"
+{"intent": "cancel", "confidence": 0.96, "faq_topic": null, "raw_datetime_text": null}
+
+message: "something came up, I can't make Monday"
+{"intent": "cancel", "confidence": 0.88, "faq_topic": null, "raw_datetime_text": "Monday"}
+
+message: "how do I cancel an appointment?"
+{"intent": "faq", "confidence": 0.93, "faq_topic": "cancellation", "raw_datetime_text": null}
 
 message: "what's the weather in Paris?"
 {"intent": "out_of_scope", "confidence": 0.98, "faq_topic": null, "raw_datetime_text": null}

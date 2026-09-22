@@ -1013,7 +1013,6 @@ app/
   domain/scheduling.py business-hours validation, slot alignment
   domain/otp.py        one-time codes: hashing, expiry, attempt budget
   services/            calendar + email, both live
-prompts/               the prompt driving each phase, with its assumptions
 tests/
 ```
 
